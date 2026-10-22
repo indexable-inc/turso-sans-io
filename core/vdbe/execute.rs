@@ -5395,7 +5395,8 @@ pub fn op_auto_commit(
         AutoCommit {
             auto_commit,
             rollback,
-            concurrent
+            concurrent,
+            read_only
         },
         insn
     );
@@ -5501,6 +5502,8 @@ pub fn op_auto_commit(
                 }
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
+                conn.set_tx_has_started(false);
                 conn.set_cdc_transaction_id(-1);
             }
             TxOp::Commit => {
@@ -5521,6 +5524,8 @@ pub fn op_auto_commit(
                 check_deferred_fk_on_commit(&conn)?;
                 vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
+                conn.set_tx_read_only(false);
+                conn.set_tx_has_started(false);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
             TxOp::Begin => {
@@ -5554,23 +5559,16 @@ pub fn op_auto_commit(
                 // Read: a SELECT in autocommit mode is still open; leave as-is — the
                 //       next write inside the explicit transaction will upgrade to Write.
                 conn.auto_commit.store(false, Ordering::SeqCst);
+                conn.set_tx_read_only(*read_only);
+                conn.set_tx_has_started(false);
                 return Ok(InsnFunctionStepResult::Done);
             }
         }
     } else {
         return match &tx_op {
-            TxOp::Begin => Err(LimboError::TxError(
-                "cannot start a transaction within a transaction".to_string(),
-            )
-            .into()),
-            TxOp::Commit => Err(LimboError::TxError(
-                "cannot commit - no transaction is active".to_string(),
-            )
-            .into()),
-            TxOp::Rollback => Err(LimboError::TxError(
-                "cannot rollback - no transaction is active".to_string(),
-            )
-            .into()),
+            TxOp::Begin => Err(LimboError::TransactionAlreadyActive.into()),
+            TxOp::Commit => Err(LimboError::NoActiveTransaction { op: "commit" }.into()),
+            TxOp::Rollback => Err(LimboError::NoActiveTransaction { op: "rollback" }.into()),
         };
     }
 
@@ -5915,6 +5913,7 @@ fn release_commit_insn() -> Insn {
         auto_commit: true,
         rollback: false,
         concurrent: false,
+        read_only: false,
     }
 }
 
