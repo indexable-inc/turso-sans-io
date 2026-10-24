@@ -304,6 +304,7 @@ expect error {
 }
 
 # A double-quoted name that is not a column is a string literal, as in SELECT.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test create-index-double-quoted-string-in-expression {
     CREATE TABLE t20(c);
@@ -316,6 +317,7 @@ expect {
     2021-05-01
 }
 
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test create-index-double-quoted-string-in-where {
     CREATE TABLE t21(c);
@@ -329,6 +331,7 @@ expect {
     2
 }
 
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test create-index-double-quoted-string-alone {
     CREATE TABLE t22(c);

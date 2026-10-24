@@ -3471,6 +3471,7 @@ expect error {
 
 # RENAME COLUMN and DROP COLUMN store double-quoted strings in indexes with single quotes,
 # so the indexes keep reading strings after a column of that name is added.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test alter-table-rename-column-single-quotes-index-strings {
     CREATE TABLE t(c, x);
@@ -3491,6 +3492,7 @@ expect {
     1
 }
 
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test alter-table-drop-column-single-quotes-index-strings {
     CREATE TABLE t(c, x);
@@ -3511,6 +3513,7 @@ expect {
     1
 }
 
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test alter-table-rename-column-to-index-string {
     CREATE TABLE t(c, x);
@@ -3536,6 +3539,7 @@ expect error {
 
 # Like SQLite, which reloads the schema after ADD COLUMN, a double-quoted string in an index
 # names the added column from then on. A single-quoted string stays a string.
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
 @cross-check-integrity
 test alter-table-add-column-named-like-index-string {
     CREATE TABLE t(c);
