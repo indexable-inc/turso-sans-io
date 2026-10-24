@@ -6512,7 +6512,7 @@ impl Index {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let index_columns = resolve_sorted_columns(table, &columns)?;
                 if let Some(where_clause) = &mut where_clause {
-                    double_quoted_names_to_strings(where_clause, table)?;
+                    double_quoted_names_to_strings(where_clause, table, true)?;
                 }
                 if let Some(using) = using {
                     if where_clause.is_some() {

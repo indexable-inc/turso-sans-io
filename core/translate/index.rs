@@ -169,7 +169,7 @@ pub fn translate_create_index(
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
     let mut where_clause = where_clause;
     if let Some(where_clause) = &mut where_clause {
-        double_quoted_names_to_strings(where_clause, &tbl)?;
+        double_quoted_names_to_strings(where_clause, &tbl, true)?;
     }
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
@@ -968,11 +968,13 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        let mut expr = sc.expr.clone();
+        double_quoted_names_to_strings(&mut expr, table, false)?;
+        if matches!(unwrapped_expr, Expr::Literal(ast::Literal::String(_)))
+            || !validate_index_expression(&expr, table)
+        {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
-        let mut expr = sc.expr.clone();
-        double_quoted_names_to_strings(&mut expr, table)?;
         resolved
             .push_within_capacity(IndexColumn {
                 name: expr.to_string(),
@@ -1057,17 +1059,7 @@ fn resolve_index_column<'a>(
 /// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
 /// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
 /// Expressions in CREATE INDEX statements may not use subqueries.
-/// Additionally, a standalone string literal is interpreted as a column name (for backwards
-/// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
-    // A top-level string literal would have been handled by resolve_index_column().
-    // If we get here with a string literal, it means the column doesn't exist.
-    // (SQLite interprets standalone string literals as column names for backwards compat.)
-    // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
-    if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
-        return false;
-    }
-
     let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
         let n = normalize_ident(name);
@@ -1102,7 +1094,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             Expr::Literal(_) | Expr::RowId { .. } => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
-                if !has_col(n.as_str()) && !is_double_quoted_string(n, table) {
+                if !has_col(n.as_str()) {
                     ok = false;
                 }
             }
@@ -1154,11 +1146,15 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
 /// Like SQLite, reads a double-quoted name that is not a column of the indexed table as a
 /// string literal. This is done once, when the index is created or loaded from the schema,
 /// so the index does not start reading a column of that name added later.
-pub fn double_quoted_names_to_strings(expr: &mut Expr, table: &BTreeTable) -> crate::Result<bool> {
+pub fn double_quoted_names_to_strings(
+    expr: &mut Expr,
+    table: &BTreeTable,
+    rowid_names_are_columns: bool,
+) -> crate::Result<bool> {
     let mut changed = false;
     walk_expr_mut(expr, &mut |e: &mut Expr| -> crate::Result<WalkControl> {
         if let Expr::Id(name) = e {
-            if is_double_quoted_string(name, table) {
+            if is_double_quoted_string(name, table, rowid_names_are_columns) {
                 *e = Expr::Literal(ast::Literal::String(name.as_literal()));
                 changed = true;
             }
@@ -1168,10 +1164,15 @@ pub fn double_quoted_names_to_strings(expr: &mut Expr, table: &BTreeTable) -> cr
     Ok(changed)
 }
 
-fn is_double_quoted_string(name: &ast::Name, table: &BTreeTable) -> bool {
+fn is_double_quoted_string(
+    name: &ast::Name,
+    table: &BTreeTable,
+    rowid_names_are_columns: bool,
+) -> bool {
     name.quoted_with('"')
         && table.get_column(name.as_str()).is_none()
-        && !(table.has_rowid
+        && !(rowid_names_are_columns
+            && table.has_rowid
             && ROWID_STRS
                 .iter()
                 .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str())))

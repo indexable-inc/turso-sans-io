@@ -354,3 +354,45 @@ test create-index-double-quoted-column-name {
 expect {
     2
 }
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+@cross-check-integrity
+test create-index-double-quoted-rowid-name {
+    CREATE TABLE t24(c);
+    INSERT INTO t24 VALUES ('a'), ('b');
+    CREATE INDEX idx24a ON t24(c || "oid");
+    CREATE INDEX idx24b ON t24(c) WHERE c > "rowid";
+    SELECT c FROM t24 INDEXED BY idx24a WHERE c || 'oid' = 'boid';
+    SELECT count(*) FROM t24 INDEXED BY idx24b WHERE c > rowid;
+}
+expect {
+    b
+    2
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-now-in-expression {
+    CREATE TABLE t25(c);
+    INSERT INTO t25 VALUES (1);
+    CREATE INDEX idx25 ON t25(c, datetime("now"));
+}
+expect error {
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-localtime-in-expression {
+    CREATE TABLE t26(c);
+    INSERT INTO t26 VALUES (1);
+    CREATE INDEX idx26 ON t26(strftime('%s', c, "localtime"));
+}
+expect error {
+}
+
+@skip-if sqlite "the CI sqlite3 CLI is built with SQLITE_DQS=0, so it rejects double-quoted strings"
+test create-index-double-quoted-now-in-where {
+    CREATE TABLE t27(c);
+    INSERT INTO t27 VALUES (1);
+    CREATE INDEX idx27 ON t27(c) WHERE c > julianday("now");
+}
+expect error {
+}

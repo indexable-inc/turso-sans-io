@@ -12311,10 +12311,11 @@ pub fn op_function(
 
                         let mut changed = false;
                         for column in &mut columns {
-                            changed |= double_quoted_names_to_strings(&mut column.expr, &table)?;
+                            changed |=
+                                double_quoted_names_to_strings(&mut column.expr, &table, false)?;
                         }
                         if let Some(where_clause) = &mut where_clause {
-                            changed |= double_quoted_names_to_strings(where_clause, &table)?;
+                            changed |= double_quoted_names_to_strings(where_clause, &table, true)?;
                         }
                         if !changed {
                             break 'sql None;
