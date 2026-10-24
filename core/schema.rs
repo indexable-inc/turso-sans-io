@@ -14,7 +14,9 @@ use crate::translate::emitter::Resolver;
 use crate::translate::expr::{
     bind_and_rewrite_expr, walk_expr, walk_expr_mut, BindingBehavior, WalkControl,
 };
-use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::index::{
+    double_quoted_names_to_strings, resolve_index_method_parameters, resolve_sorted_columns,
+};
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord};
@@ -6502,13 +6504,16 @@ impl Index {
                 tbl_name,
                 columns,
                 unique,
-                where_clause,
+                mut where_clause,
                 using,
                 with_clause,
                 ..
             })) => {
                 let index_name = normalize_ident(idx_name.name.as_str());
                 let index_columns = resolve_sorted_columns(table, &columns)?;
+                if let Some(where_clause) = &mut where_clause {
+                    double_quoted_names_to_strings(where_clause, table)?;
+                }
                 if let Some(using) = using {
                     if where_clause.is_some() {
                         bail_parse_error!("custom index module do not support partial indices");

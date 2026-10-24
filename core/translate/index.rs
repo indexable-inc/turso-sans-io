@@ -13,10 +13,11 @@ use crate::translate::{
     },
     expr::{
         bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
-        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
+        unwrap_parens, walk_expr, walk_expr_mut, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
+    planner::ROWID_STRS,
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
 use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
@@ -166,6 +167,10 @@ pub fn translate_create_index(
         bail_parse_error!("CREATE INDEX on WITHOUT ROWID tables is not supported");
     }
     let columns = resolve_sorted_columns_with_resolver(&tbl, &columns, Some(resolver))?;
+    let mut where_clause = where_clause;
+    if let Some(where_clause) = &mut where_clause {
+        double_quoted_names_to_strings(where_clause, &tbl)?;
+    }
 
     // Block CREATE INDEX on non-orderable custom type columns and STRUCT/UNION columns
     for col in &columns {
@@ -966,15 +971,17 @@ fn resolve_sorted_columns_with_resolver(
         if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
+        let mut expr = sc.expr.clone();
+        double_quoted_names_to_strings(&mut expr, table)?;
         resolved
             .push_within_capacity(IndexColumn {
-                name: sc.expr.to_string(),
+                name: expr.to_string(),
                 order,
                 nulls_order: nulls,
                 pos_in_table: EXPR_INDEX_SENTINEL,
                 collation: explicit_collation,
                 default: None,
-                expr: Some(sc.expr.clone()),
+                expr: Some(expr),
             })
             .expect("resolved index columns vector was preallocated to cols.len()");
     }
@@ -1095,7 +1102,7 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             Expr::Literal(_) | Expr::RowId { .. } => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
-                if !has_col(n.as_str()) {
+                if !has_col(n.as_str()) && !is_double_quoted_string(n, table) {
                     ok = false;
                 }
             }
@@ -1142,6 +1149,32 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         })
     });
     ok
+}
+
+/// Like SQLite, reads a double-quoted name that is not a column of the indexed table as a
+/// string literal. This is done once, when the index is created or loaded from the schema,
+/// so the index does not start reading a column of that name added later.
+pub fn double_quoted_names_to_strings(expr: &mut Expr, table: &BTreeTable) -> crate::Result<bool> {
+    let mut changed = false;
+    walk_expr_mut(expr, &mut |e: &mut Expr| -> crate::Result<WalkControl> {
+        if let Expr::Id(name) = e {
+            if is_double_quoted_string(name, table) {
+                *e = Expr::Literal(ast::Literal::String(name.as_literal()));
+                changed = true;
+            }
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(changed)
+}
+
+fn is_double_quoted_string(name: &ast::Name, table: &BTreeTable) -> bool {
+    name.quoted_with('"')
+        && table.get_column(name.as_str()).is_none()
+        && !(table.has_rowid
+            && ROWID_STRS
+                .iter()
+                .any(|rowid| rowid.eq_ignore_ascii_case(name.as_str())))
 }
 
 fn emit_index_column_value_from_cursor(

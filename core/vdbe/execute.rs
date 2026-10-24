@@ -29,6 +29,7 @@ use crate::storage::pager::{
 };
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
+use crate::translate::index::{double_quoted_names_to_strings, resolve_sorted_columns};
 use crate::types::IOResultOr;
 use crate::types::{
     compare_immutable, compare_immutable_single, compare_record, AsValueRef, Extendable,
@@ -12258,6 +12259,92 @@ pub fn op_function(
 
                     (new_name, new_tbl_name, new_sql)
                 }
+                AlterTableFunc::QuoteFix => {
+                    let Value::Text(database_name) = &state.registers[*start_reg + 5].get_value()
+                    else {
+                        panic!("database parameter should be TEXT")
+                    };
+                    let database_id = program
+                        .connection
+                        .get_database_id_by_name(database_name.as_str())?;
+
+                    let new_sql = 'sql: {
+                        let Value::Text(sql) = sql else {
+                            break 'sql None;
+                        };
+                        if entry_type.as_str() != "index" {
+                            break 'sql None;
+                        }
+
+                        let cmd = parse_schema_sql_for_alter(
+                            program.connection.dialect().as_ref(),
+                            entry_type.as_str(),
+                            *root_page,
+                            sql.as_str(),
+                        )?;
+                        let Some(ast::Cmd::Stmt(ast::Stmt::CreateIndex {
+                            tbl_name: index_tbl_name,
+                            mut columns,
+                            unique,
+                            if_not_exists,
+                            idx_name,
+                            mut where_clause,
+                            using,
+                            with_clause,
+                        })) = cmd
+                        else {
+                            return Err(LimboError::InternalError(format!(
+                                "schema SQL of index {name} is not CREATE INDEX"
+                            ))
+                            .into());
+                        };
+                        let table = program
+                            .connection
+                            .with_schema(database_id, |schema| {
+                                schema.get_btree_table(&normalize_ident(index_tbl_name.as_str()))
+                            })
+                            .ok_or_else(|| {
+                                LimboError::InternalError(format!(
+                                    "table {index_tbl_name} of index {name} is not in the schema"
+                                ))
+                            })?;
+
+                        let mut changed = false;
+                        for column in &mut columns {
+                            changed |= double_quoted_names_to_strings(&mut column.expr, &table)?;
+                        }
+                        if let Some(where_clause) = &mut where_clause {
+                            changed |= double_quoted_names_to_strings(where_clause, &table)?;
+                        }
+                        if !changed {
+                            break 'sql None;
+                        }
+                        // Like SQLite, fail when the rewritten index no longer loads, e.g. a
+                        // bare 'name' is read as a column name.
+                        resolve_sorted_columns(&table, &columns).map_err(|e| match e {
+                            LimboError::ParseError(message) => {
+                                LimboError::ParseError(format!("error in index {name}: {message}"))
+                            }
+                            e => e,
+                        })?;
+
+                        Some(
+                            ast::Stmt::CreateIndex {
+                                tbl_name: index_tbl_name,
+                                columns,
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                where_clause,
+                                using,
+                                with_clause,
+                            }
+                            .to_string(),
+                        )
+                    };
+
+                    (name, tbl_name, new_sql)
+                }
                 AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
                     let table = {
                         match &state.registers[*start_reg + 5].get_value() {
@@ -18033,6 +18120,14 @@ pub fn op_add_column(
 
         // Resolve generated column expressions and update virtual column metadata
         btree.prepare_generated_columns()?;
+
+        for index_name in &data.reloaded_indexes {
+            let index = schema
+                .get_index(&normalized_table_name, index_name)
+                .expect("reloaded index should be in schema")
+                .clone();
+            schema.remove_index(&index);
+        }
         Ok(())
     })??;
 

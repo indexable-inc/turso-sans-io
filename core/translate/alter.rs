@@ -21,7 +21,7 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{emit_stored_column, walk_expr, walk_expr_mut, WalkControl},
+        expr::{emit_stored_column, sanitize_string, walk_expr, walk_expr_mut, WalkControl},
         plan::{
             ColumnMask, ColumnUsedMask, JoinedTable, Operation, OuterQueryReference,
             TableReferences,
@@ -746,6 +746,11 @@ pub fn translate_alter_table(
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
+    let target_db_name = resolver.namespace_name(database_id).ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "unknown database id {database_id} during ALTER TABLE"
+        ))
+    })?;
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
     validate(&alter_table, table_name)?;
     reject_alter_of_view(&alter_table, table_name, resolver, database_id)?;
@@ -1073,6 +1078,16 @@ pub fn translate_alter_table(
             } else {
                 None
             };
+
+            emit_sqlite_schema_rewrite(
+                program,
+                resolver,
+                connection,
+                database_id,
+                table_name,
+                AlterTableFunc::QuoteFix,
+                &[target_db_name],
+            )?;
 
             let mut rewrite_rows_result = Ok(());
             translate_update_for_schema_change(
@@ -1412,6 +1427,16 @@ pub fn translate_alter_table(
                 database_id,
             )?;
 
+            let column_name = column
+                .name
+                .as_deref()
+                .expect("added column should be named");
+            let reloaded_indexes: Vec<String> = table_indexes
+                .iter()
+                .filter(|index| index_has_string(index, column_name))
+                .map(|index| index.name.clone())
+                .collect();
+
             translate_update_for_schema_change(
                 update,
                 resolver,
@@ -1425,6 +1450,14 @@ pub fn translate_alter_table(
                         value: schema_version as i32 + 1,
                         p5: 0,
                     });
+                    let reload_where_clause = (!reloaded_indexes.is_empty()).then(|| {
+                        let names = reloaded_indexes
+                            .iter()
+                            .map(|name| format!("'{}'", escape_sql_string_literal(name)))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        format!("type = 'index' AND name COLLATE NOCASE IN ({names})")
+                    });
                     program.emit_insn(Insn::AddColumn {
                         data: Box::new(AddColumnData {
                             db: database_id,
@@ -1432,8 +1465,18 @@ pub fn translate_alter_table(
                             column,
                             check_constraints: btree.check_constraints.to_vec(),
                             foreign_keys: btree.foreign_keys.to_vec(),
+                            reloaded_indexes,
                         }),
                     });
+                    // Like SQLite, which reloads the schema after ADD COLUMN, a double-quoted
+                    // string in these indexes now names the new column.
+                    if let Some(where_clause) = reload_where_clause {
+                        program.emit_insn(Insn::ParseSchema {
+                            db: database_id,
+                            where_clause: Some(where_clause),
+                            trigger_target_database_id: None,
+                        });
+                    }
                 },
             )?
         }
@@ -1511,76 +1554,15 @@ pub fn translate_alter_table(
                 None
             };
 
-            let sqlite_schema = resolver
-                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
-                .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-                })?;
-
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns().len();
-                turso_assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(table_name.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(new_name.to_string());
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(5);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(AlterTableFunc::RenameTable),
-                        arg_count: 7,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(out),
-                    count: to_u32(sqlite_schema_column_len),
-                    dest_reg: to_u32(record),
-                    index_name: None,
-                    affinity_str: None,
-                });
-
-                // In MVCC mode, we need to delete before insert to properly
-                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if database_uses_mvcc(connection, database_id) {
-                    program.emit_insn(Insn::Delete {
-                        cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
-                        is_part_of_update: true,
-                    });
-                }
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
+            emit_sqlite_schema_rewrite(
+                program,
+                resolver,
+                connection,
+                database_id,
+                table_name,
+                AlterTableFunc::RenameTable,
+                &[table_name.to_string(), new_name.to_string()],
+            )?;
 
             emit_rename_sqlite_sequence_entry(
                 program,
@@ -1940,11 +1922,6 @@ pub fn translate_alter_table(
                         }
                     }
                 }
-                let target_db_name = resolver.namespace_name(database_id).ok_or_else(|| {
-                    LimboError::InternalError(format!(
-                        "unknown database id {database_id} during ALTER TABLE"
-                    ))
-                })?;
                 views_to_rewrite = resolver.with_schema(database_id, |s| -> Result<_> {
                     let mut rewrites = Vec::new();
                     for (view_name, view) in s.views.iter() {
@@ -2002,83 +1979,32 @@ pub fn translate_alter_table(
                 None
             };
 
-            let sqlite_schema = resolver
-                .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
-                .ok_or_else(|| {
-                    LimboError::ParseError("sqlite_schema table not found in schema".to_string())
-                })?;
-
-            let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
-
-            program.emit_insn(Insn::OpenWrite {
-                cursor_id,
-                root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
-                db: database_id,
-            });
-
-            program.cursor_loop(cursor_id, |program, rowid| {
-                let sqlite_schema_column_len = sqlite_schema.columns().len();
-                turso_assert_eq!(sqlite_schema_column_len, 5);
-
-                let first_column = program.alloc_registers(sqlite_schema_column_len);
-
-                for i in 0..sqlite_schema_column_len {
-                    program.emit_column_or_rowid(cursor_id, i, first_column + i);
-                }
-
-                program.emit_string8_new_reg(table_name.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(from.to_string());
-                program.mark_last_insn_constant();
-
-                program.emit_string8_new_reg(definition.to_string());
-                program.mark_last_insn_constant();
-
-                let out = program.alloc_registers(sqlite_schema_column_len);
-
-                program.emit_insn(Insn::Function {
-                    constant_mask: 0,
-                    start_reg: first_column,
-                    dest: out,
-                    func: crate::function::FuncCtx {
-                        func: Func::AlterTable(if rename {
-                            AlterTableFunc::RenameColumn
-                        } else {
-                            AlterTableFunc::AlterColumn
-                        }),
-                        arg_count: 8,
-                    },
-                });
-
-                let record = program.alloc_register();
-
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u32(out),
-                    count: to_u32(sqlite_schema_column_len),
-                    dest_reg: to_u32(record),
-                    index_name: None,
-                    affinity_str: None,
-                });
-
-                // In MVCC mode, we need to delete before insert to properly
-                // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
-                if database_uses_mvcc(connection, database_id) {
-                    program.emit_insn(Insn::Delete {
-                        cursor_id,
-                        table_name: SQLITE_TABLEID.to_string(),
-                        is_part_of_update: true,
-                    });
-                }
-
-                program.emit_insn(Insn::Insert {
-                    cursor: cursor_id,
-                    key_reg: rowid,
-                    record_reg: record,
-                    flag: crate::vdbe::insn::InsertFlags(0),
-                    table_name: table_name.to_string(),
-                });
-            });
+            emit_sqlite_schema_rewrite(
+                program,
+                resolver,
+                connection,
+                database_id,
+                table_name,
+                AlterTableFunc::QuoteFix,
+                &[target_db_name],
+            )?;
+            emit_sqlite_schema_rewrite(
+                program,
+                resolver,
+                connection,
+                database_id,
+                table_name,
+                if rename {
+                    AlterTableFunc::RenameColumn
+                } else {
+                    AlterTableFunc::AlterColumn
+                },
+                &[
+                    table_name.to_string(),
+                    from.to_string(),
+                    definition.to_string(),
+                ],
+            )?;
 
             // Update trigger SQL for renamed columns
             for (trigger_database_id, trigger_name, new_sql) in triggers_to_rewrite.clone() {
@@ -2246,6 +2172,110 @@ pub fn translate_alter_table(
         }
     };
 
+    Ok(())
+}
+
+/// Whether `index` has a string literal equal to `value`. Such a literal may come from a
+/// double-quoted name in the index SQL.
+fn index_has_string(index: &Index, value: &str) -> bool {
+    let mut found = false;
+    let mut check = |e: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Literal(ast::Literal::String(s)) = e {
+            found |= sanitize_string(s).eq_ignore_ascii_case(value);
+        }
+        Ok(WalkControl::Continue)
+    };
+    for expr in index
+        .columns
+        .iter()
+        .filter_map(|column| column.expr.as_deref())
+        .chain(index.where_clause.as_deref())
+    {
+        walk_expr(expr, &mut check).expect("index string search does not fail");
+    }
+    found
+}
+
+/// Rewrites every row of the database's sqlite_schema with `func`, called with the row's five
+/// columns followed by `args`.
+fn emit_sqlite_schema_rewrite(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Arc<crate::Connection>,
+    database_id: usize,
+    table_name: &str,
+    func: AlterTableFunc,
+    args: &[String],
+) -> Result<()> {
+    let sqlite_schema = resolver
+        .with_schema(database_id, |s| s.get_btree_table(SQLITE_TABLEID))
+        .ok_or_else(|| {
+            LimboError::ParseError("sqlite_schema table not found in schema".to_string())
+        })?;
+
+    let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_schema.clone()));
+
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id,
+        root_page: RegisterOrLiteral::Literal(sqlite_schema.root_page),
+        db: database_id,
+    });
+
+    program.cursor_loop(cursor_id, |program, rowid| {
+        let sqlite_schema_column_len = sqlite_schema.columns().len();
+        turso_assert_eq!(sqlite_schema_column_len, 5);
+
+        let first_column = program.alloc_registers(sqlite_schema_column_len);
+
+        for i in 0..sqlite_schema_column_len {
+            program.emit_column_or_rowid(cursor_id, i, first_column + i);
+        }
+
+        for arg in args {
+            program.emit_string8_new_reg(arg.clone());
+            program.mark_last_insn_constant();
+        }
+
+        let out = program.alloc_registers(sqlite_schema_column_len);
+
+        program.emit_insn(Insn::Function {
+            constant_mask: 0,
+            start_reg: first_column,
+            dest: out,
+            func: crate::function::FuncCtx {
+                func: Func::AlterTable(func),
+                arg_count: sqlite_schema_column_len + args.len(),
+            },
+        });
+
+        let record = program.alloc_register();
+
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u32(out),
+            count: to_u32(sqlite_schema_column_len),
+            dest_reg: to_u32(record),
+            index_name: None,
+            affinity_str: None,
+        });
+
+        // In MVCC mode, we need to delete before insert to properly
+        // end the old version (Hekaton-style UPDATE = DELETE + INSERT)
+        if database_uses_mvcc(connection, database_id) {
+            program.emit_insn(Insn::Delete {
+                cursor_id,
+                table_name: SQLITE_TABLEID.to_string(),
+                is_part_of_update: true,
+            });
+        }
+
+        program.emit_insn(Insn::Insert {
+            cursor: cursor_id,
+            key_reg: rowid,
+            record_reg: record,
+            flag: crate::vdbe::insn::InsertFlags(0),
+            table_name: table_name.to_string(),
+        });
+    });
     Ok(())
 }
 
