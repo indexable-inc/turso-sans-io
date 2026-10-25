@@ -18,6 +18,8 @@
 pub mod io;
 pub mod mem;
 mod storage;
+#[cfg(test)]
+mod tests;
 mod wal;
 
 pub use io::StreamIo;

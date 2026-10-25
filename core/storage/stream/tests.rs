@@ -1,0 +1,660 @@
+//! Fork tests for the stream storage layer (streams-guest-api v9 §14 and
+//! §16). Every test runs over [`MemStore`] with reads that complete one run
+//! late, so any yield between a reserve and the `add_dirty` it covers is
+//! exercised, and every test checks the two invariants: nothing blocked
+//! (`blocking_calls == 0`) and `add_dirty` never hit its hard rule
+//! (`hard_rule_full == 0`).
+
+use super::mem::{MemArena, MemRunner, MemStore};
+use super::{StreamConfig, StreamDb, StreamIo, StreamStats, StreamStorage};
+use crate::types::IOResult;
+use crate::{
+    ConnectAsyncState, ConnectOpts, Connection, Database, LimboError, OpenDbAsyncState,
+    OpenOptions, SqliteDialect, StepResult, Value, IO,
+};
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+use std::sync::Arc;
+
+// ---- heap accounting -------------------------------------------------------
+
+thread_local! {
+    static COUNT: Cell<bool> = const { Cell::new(false) };
+    static CUR: Cell<isize> = const { Cell::new(0) };
+    static PEAK: Cell<isize> = const { Cell::new(0) };
+}
+
+/// Counts heap bytes allocated by guest code on this thread (allocations
+/// made while `COUNT` is set carry their size in a prefix, so frees made
+/// anywhere are matched). The in-memory store's own pages are not counted:
+/// on wasm they live in the host.
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        let pre = l.align().max(16);
+        let full = unsafe { Layout::from_size_align_unchecked(l.size() + pre, l.align().max(16)) };
+        let p = unsafe { System.alloc(full) };
+        if p.is_null() {
+            return p;
+        }
+        let counted = COUNT.try_with(Cell::get).unwrap_or(false);
+        let tag = if counted { l.size() } else { 0 };
+        unsafe { (p.add(pre - 8) as *mut usize).write(tag) };
+        if counted {
+            let _ = CUR.try_with(|c| {
+                let v = c.get() + l.size() as isize;
+                c.set(v);
+                let _ = PEAK.try_with(|p| p.set(p.get().max(v)));
+            });
+        }
+        unsafe { p.add(pre) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, l: Layout) {
+        let pre = l.align().max(16);
+        let base = unsafe { ptr.sub(pre) };
+        let tag = unsafe { (base.add(pre - 8) as *const usize).read() };
+        if tag != 0 {
+            let _ = CUR.try_with(|c| c.set(c.get() - tag as isize));
+        }
+        let full = unsafe { Layout::from_size_align_unchecked(l.size() + pre, l.align().max(16)) };
+        unsafe { System.dealloc(base, full) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Counting = Counting;
+
+fn guest_scope(on: bool) {
+    COUNT.with(|c| c.set(on));
+}
+
+fn heap_now() -> isize {
+    CUR.with(Cell::get)
+}
+
+fn heap_reset_peak() -> isize {
+    let now = heap_now();
+    PEAK.with(|p| p.set(now));
+    now
+}
+
+fn heap_peak() -> isize {
+    PEAK.with(Cell::get)
+}
+
+// ---- harness ---------------------------------------------------------------
+
+const MAX_RUNS: u64 = 1_000_000;
+
+struct H {
+    r: MemRunner,
+    sdb: Arc<StreamDb>,
+    db: Arc<Database>,
+    conn: Arc<Connection>,
+    /// Every this many runs, another statement takes every free slot for
+    /// the run (`stream_test_squeeze`) before this one steps. 0: never.
+    squeeze_every: u64,
+    // Last: the arena outlives everything that points into it.
+    _arena: MemArena,
+}
+
+#[derive(Clone, Copy)]
+struct Cfg {
+    slots: u32,
+    scratch: u32,
+    quota: u64,
+    read_delay: u64,
+    count_heap: bool,
+}
+
+impl Default for Cfg {
+    fn default() -> Self {
+        Self {
+            slots: 256,
+            scratch: 65_536,
+            quota: u64::MAX / 2,
+            read_delay: 1,
+            count_heap: false,
+        }
+    }
+}
+
+/// Re-enter `f` only once the IO it returned has finished: the open and
+/// connect state machines assume their caller waits.
+fn drive<T>(
+    r: &mut MemRunner,
+    mut f: impl FnMut() -> crate::Result<IOResult<T>, Box<LimboError>>,
+) -> T {
+    let mut wait: Option<crate::types::IOCompletions> = None;
+    for _ in 0..MAX_RUNS {
+        let out = r.run(|| {
+            if wait.as_ref().is_some_and(|c| !c.finished()) {
+                return None;
+            }
+            Some(f())
+        });
+        match out {
+            None => {}
+            Some(Ok(IOResult::Done(v))) => return v,
+            Some(Ok(IOResult::IO(c))) => wait = Some(c),
+            Some(Err(e)) => panic!("open/connect failed: {e}"),
+        }
+    }
+    panic!("no progress after {MAX_RUNS} runs");
+}
+
+impl H {
+    fn open(cfg: Cfg) -> H {
+        let mut arena = MemArena::new(cfg.slots);
+        let sdb = unsafe {
+            StreamDb::new(
+                arena.base(),
+                cfg.slots,
+                0,
+                StreamConfig {
+                    scratch_pages: cfg.scratch,
+                    quota_pages: cfg.quota,
+                },
+            )
+        };
+        let io: Arc<dyn IO> = StreamIo::new(sdb.clone(), 7);
+        let mut store = MemStore::new();
+        store.read_delay = cfg.read_delay;
+        let mut r = MemRunner::new(sdb.clone(), store);
+        if cfg.count_heap {
+            r.scope = guest_scope;
+        }
+        let opts = OpenOptions::new(Arc::new(SqliteDialect))
+            .storage(Arc::new(StreamStorage::new(sdb.clone())));
+        let mut st = OpenDbAsyncState::new();
+        let db = drive(&mut r, || {
+            Database::open_async(&mut st, io.clone(), ":memory:stream", &opts)
+        });
+        let mut cst = ConnectAsyncState::new();
+        let conn = drive(&mut r, || db.connect_async(ConnectOpts::new(), &mut cst));
+        let h = H {
+            r,
+            sdb,
+            db,
+            conn,
+            squeeze_every: 0,
+            _arena: arena,
+        };
+        h.check_invariants();
+        h
+    }
+
+    fn connect(&mut self) -> Arc<Connection> {
+        let mut cst = ConnectAsyncState::new();
+        let db = self.db.clone();
+        drive(&mut self.r, || {
+            db.connect_async(ConnectOpts::new(), &mut cst)
+        })
+    }
+
+    fn stats(&self) -> StreamStats {
+        self.sdb.stats()
+    }
+
+    fn check_invariants(&self) {
+        let s = self.stats();
+        assert_eq!(s.blocking_calls, 0, "something blocked: {s:?}");
+        assert_eq!(s.hard_rule_full, 0, "add_dirty hit the hard rule: {s:?}");
+    }
+
+    /// Run `sql` on `conn` to completion, one step loop per run (a run ends
+    /// at the first IO). Returns the rows.
+    fn exec_on(
+        &mut self,
+        conn: &Arc<Connection>,
+        sql: &str,
+        params: &[Value],
+    ) -> crate::Result<Vec<Vec<Value>>> {
+        let mut stmt = self.r.run(|| conn.prepare(sql))?;
+        for (i, p) in params.iter().enumerate() {
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), p.clone())?;
+        }
+        let mut rows = Vec::new();
+        let squeeze = self.squeeze_every;
+        for _ in 0..MAX_RUNS {
+            let squeeze_now = squeeze > 0 && self.r.runs % squeeze == 0;
+            let done = self.r.run(|| -> crate::Result<bool> {
+                if squeeze_now {
+                    conn.pager.load().stream_test_squeeze(None);
+                }
+                loop {
+                    match stmt.step()? {
+                        StepResult::Row => {
+                            let row = stmt.row().expect("row");
+                            rows.push(row.get_values().cloned().collect());
+                        }
+                        StepResult::Done => return Ok(true),
+                        StepResult::IO => return Ok(false),
+                        StepResult::Yield => return Ok(false),
+                        other => panic!("unexpected step result {other:?}"),
+                    }
+                }
+            })?;
+            if done {
+                self.check_invariants();
+                return Ok(rows);
+            }
+        }
+        let pager = conn.pager.load().clone();
+        panic!(
+            "statement made no progress after {MAX_RUNS} runs: {sql}\n{:?}\nslots {:?}, free_page {}, due {}",
+            self.stats(),
+            self.sdb.pool().page_slots(),
+            pager.stream_test_free_page_state(),
+            self.r.store.has_due()
+        );
+    }
+
+    fn exec(&mut self, sql: &str) -> crate::Result<Vec<Vec<Value>>> {
+        let conn = self.conn.clone();
+        self.exec_on(&conn, sql, &[])
+    }
+
+    fn ok(&mut self, sql: &str) {
+        if let Err(e) = self.exec(sql) {
+            panic!(
+                "{sql}: {e}\n{:?}\nslots (total, free, lent): {:?}",
+                self.stats(),
+                self.sdb.pool().page_slots()
+            );
+        }
+    }
+
+    fn one(&mut self, sql: &str) -> i64 {
+        let rows = self.exec(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+        match &rows[..] {
+            [row] => int(&row[0]),
+            _ => panic!("{sql}: {} rows", rows.len()),
+        }
+    }
+
+    /// A table `name` of about `pages` leaf pages: 4 rows of ~900 bytes per
+    /// page, `n` = 0 in every row.
+    fn fill(&mut self, name: &str, pages: u64) {
+        let rows = pages * 4;
+        self.ok(&format!(
+            "CREATE TABLE {name}(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, v BLOB)"
+        ));
+        self.ok(&format!(
+            "INSERT INTO {name}(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {rows}) \
+             SELECT i, 0, zeroblob(900) FROM c"
+        ));
+    }
+
+    fn integrity(&mut self) {
+        let rows = self
+            .exec("PRAGMA integrity_check")
+            .expect("integrity_check");
+        let text: Vec<String> = rows.iter().map(|r| format!("{:?}", r[0])).collect();
+        assert!(
+            text.len() == 1 && text[0].contains("ok"),
+            "integrity_check: {text:?}"
+        );
+    }
+}
+
+fn int(v: &Value) -> i64 {
+    match v {
+        Value::Null => 0,
+        v => v
+            .as_int()
+            .unwrap_or_else(|| panic!("not an integer: {v:?}")),
+    }
+}
+
+fn is_full(e: &LimboError) -> bool {
+    e.sqlite_result_code() == 13
+}
+
+// ---- tests -----------------------------------------------------------------
+
+#[test]
+fn insert_and_lookup_roundtrip() {
+    let mut h = H::open(Cfg::default());
+    h.ok("CREATE TABLE t(k INTEGER, v TEXT)");
+    h.ok("CREATE INDEX tk ON t(k)");
+    h.ok("BEGIN");
+    let conn = h.conn.clone();
+    for i in 0..2_000i64 {
+        h.exec_on(
+            &conn,
+            "INSERT INTO t(k, v) VALUES (?1, ?2)",
+            &[
+                Value::from_i64((i * 7919) % 2_000),
+                Value::from_text(format!("value-{i:026}")),
+            ],
+        )
+        .unwrap();
+    }
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 2_000);
+    assert_eq!(h.one("SELECT count(*) FROM t WHERE k = 1234"), 1);
+    // A second connection reads the committed state from the stream.
+    let c2 = h.connect();
+    let rows = h.exec_on(&c2, "SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 2_000);
+    h.integrity();
+    h.check_invariants();
+}
+
+/// §14 change 1 + 2: an explicit transaction far larger than the arena
+/// spills into staged parts and commits; the guest heap stays bounded.
+#[test]
+fn explicit_txn_large_update_stays_in_arena() {
+    let mut h = H::open(Cfg {
+        slots: 256,
+        count_heap: true,
+        ..Cfg::default()
+    });
+    h.fill("t", 4_000);
+    let before = h.stats();
+    let base = heap_reset_peak();
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = n + 1");
+    h.ok("COMMIT");
+    let peak = heap_peak() - base;
+    let s = h.stats();
+    assert!(
+        s.spilled_pages - before.spilled_pages >= 3_000,
+        "the update spilled: {s:?}"
+    );
+    assert!(s.parts > before.parts);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 16_000);
+    // Arena is caller memory; the heap holds the index (4 B per record),
+    // the dirty set and a constant. 16k pages of heap would be 64 MiB.
+    let bound = 4 * 16_000 + 8 * 1024 * 1024;
+    eprintln!(
+        "explicit_txn_large_update_stays_in_arena: heap peak {peak} B (bound {bound}), {s:?}"
+    );
+    assert!(peak < bound as isize, "heap peak {peak} over {bound}");
+    h.integrity();
+}
+
+/// §14 change 3: `ROLLBACK TO` after pages past the savepoint's size were
+/// spilled discards them from the transaction, and restores pre-images of
+/// the pages that existed.
+#[test]
+fn rollback_to_after_spill_discards_grown_pages() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 40);
+    let size_before = h.one("PRAGMA page_count");
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = 7");
+    h.ok(
+        "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1000 UNION ALL SELECT i + 1 FROM c WHERE i < 2200) \
+         SELECT i, 1, zeroblob(900) FROM c",
+    );
+    let grown = h.one("PRAGMA page_count");
+    assert!(grown > size_before + 200, "grew: {size_before} -> {grown}");
+    assert!(h.stats().spilled_pages > 0);
+    h.ok("ROLLBACK TO a");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 160);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.ok("COMMIT");
+    let s = h.stats();
+    assert!(s.discards > 0 && s.restored_pages > 0, "{s:?}");
+    // The committed version holds nothing past the old size.
+    let head = h.r.store.head();
+    for p in size_before as u64..grown as u64 {
+        assert!(
+            h.r.store.page_at(p, head).iter().all(|b| *b == 0),
+            "page {} committed after rollback",
+            p + 1
+        );
+    }
+    assert_eq!(h.one("PRAGMA page_count"), size_before);
+    h.integrity();
+}
+
+/// §14 change 4 (v8 index check): nested savepoints whose records add up
+/// past the scratch range fail SQLITE_FULL at the reserve, never at the
+/// hard rule, and the transaction stays usable.
+#[test]
+fn nested_savepoint_subjournal_past_scratch_fails_full() {
+    let mut h = H::open(Cfg {
+        slots: 512,
+        scratch: 160,
+        ..Cfg::default()
+    });
+    h.fill("t", 200);
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = 1 WHERE id <= 200");
+    h.ok("SAVEPOINT b");
+    let err = h
+        .exec("UPDATE t SET n = 2 WHERE id > 200")
+        .expect_err("records past S");
+    assert!(is_full(&err), "expected SQLITE_FULL, got {err}");
+    let s = h.stats();
+    assert!(s.scratch_full > 0, "{s:?}");
+    // The failed statement was rolled back; the transaction is intact.
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 200);
+    h.ok("ROLLBACK TO a");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.ok("UPDATE t SET n = 3 WHERE id <= 4");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 12);
+    h.integrity();
+    h.check_invariants();
+}
+
+/// §14 change 4 (v8): `DELETE FROM t` (ClearBtree → free_page per page) in
+/// a transaction, with an arena far smaller than the table and other
+/// statements taking the free slots every third run (reads complete two
+/// runs after they are issued, so every other run would never coincide
+/// with a read), parks in the reserves
+/// and resumes run after run instead of reaching the hard rule; `ROLLBACK`
+/// restores every page and the heap stays bounded.
+#[test]
+fn delete_all_in_txn_small_arena_parks() {
+    let mut h = H::open(Cfg {
+        slots: 48,
+        count_heap: true,
+        ..Cfg::default()
+    });
+    h.fill("t", 2_000);
+    let pages = h.one("PRAGMA page_count");
+    let before = h.stats();
+    h.ok("BEGIN");
+    let base = heap_reset_peak();
+    h.squeeze_every = 3;
+    h.ok("DELETE FROM t");
+    h.squeeze_every = 0;
+    let peak = heap_peak() - base;
+    let s = h.stats();
+    assert!(s.parks > before.parks, "parked: {s:?}");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 0);
+    h.ok("ROLLBACK");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 8_000);
+    assert_eq!(h.one("PRAGMA page_count"), pages);
+    let bound = 4 * 65_536 + 8 * 1024 * 1024;
+    eprintln!(
+        "delete_all: heap peak {peak} B (bound {bound}), parks {}, {s:?}",
+        s.parks - before.parks
+    );
+    assert!(peak < bound as isize, "heap peak {peak} over {bound}");
+    h.integrity();
+    h.check_invariants();
+}
+
+/// The same with `DROP TABLE t` (`Destroy`), then `COMMIT`: the freelist
+/// holds the table's pages.
+#[test]
+fn drop_table_in_txn_small_arena_parks() {
+    let mut h = H::open(Cfg {
+        slots: 48,
+        ..Cfg::default()
+    });
+    h.fill("t", 2_000);
+    h.fill("u", 10);
+    let before = h.stats();
+    h.ok("BEGIN");
+    h.squeeze_every = 3;
+    let runs0 = h.r.runs;
+    h.ok("DROP TABLE t");
+    h.squeeze_every = 0;
+    let mid = h.stats();
+    eprintln!(
+        "drop_table: {} runs, reads {}, parks {}, evictions {}",
+        h.r.runs - runs0,
+        mid.reads - before.reads,
+        mid.parks - before.parks,
+        mid.evictions - before.evictions
+    );
+    h.ok("COMMIT");
+    let s = h.stats();
+    assert!(s.parks > before.parks, "parked: {s:?}");
+    assert_eq!(
+        h.one("SELECT count(*) FROM sqlite_schema WHERE name = 't'"),
+        0
+    );
+    assert_eq!(h.one("SELECT count(*) FROM u"), 40);
+    assert!(h.one("PRAGMA freelist_count") >= 2_000);
+    h.integrity();
+    h.check_invariants();
+}
+
+/// F5: `free_page` reserves at `Start`, then `AddToTrunk` reads the
+/// (uncached) trunk and yields; meanwhile the slots go to another
+/// statement. The re-check after the read parks (state unchanged, no new
+/// read), and the next run finishes the free.
+#[test]
+fn free_page_first_trunk_uncached_one_slot_parks() {
+    // R for a 25-page database is 27 slots: 64 leaves room for cursors.
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 20);
+    h.ok("DELETE FROM t WHERE id <= 40");
+    assert!(h.one("PRAGMA freelist_count") > 0);
+    // A fresh connection: nothing cached, the trunk included.
+    let c2 = h.connect();
+    h.exec_on(&c2, "BEGIN", &[]).unwrap();
+    h.exec_on(&c2, "SAVEPOINT s", &[]).unwrap();
+    h.exec_on(&c2, "UPDATE t SET n = 1 WHERE id = 80", &[])
+        .unwrap();
+    let pager = c2.pager.load().clone();
+    let free_id = int(&h.exec_on(&c2, "PRAGMA page_count", &[]).unwrap()[0][0]) as usize;
+    let trunk_id = {
+        // Page 1 is cached and loaded on c2 now; read the trunk pointer.
+        let mut id = 0usize;
+        h.r.run(|| {
+            id = pager
+                .with_header(|hd| hd.freelist_trunk_page.get() as usize)
+                .ok()
+                .and_then(|r| match r {
+                    IOResult::Done(v) => Some(v),
+                    IOResult::IO(_) => None,
+                })
+                .expect("page 1 cached");
+        });
+        id
+    };
+    assert!(trunk_id > 0);
+    assert!(
+        !pager.stream_test_loaded(trunk_id),
+        "trunk must start uncached"
+    );
+    let mut squeezed_recheck = false;
+    let mut done = false;
+    for _ in 0..10_000 {
+        let reads_before = h.stats().reads;
+        let parks_before = h.stats().parks;
+        let res = h.r.run(|| {
+            let mut squeezed = false;
+            if !squeezed_recheck
+                && pager.stream_test_free_page_state() == "AddToTrunk"
+                && pager.stream_test_loaded(trunk_id)
+            {
+                // The trunk read finished: give the slots away now.
+                pager.stream_test_squeeze(Some(trunk_id));
+                squeezed = true;
+            }
+            let r = pager.free_page(None, free_id);
+            (squeezed, r)
+        });
+        let (squeezed, r) = res;
+        match r {
+            Ok(IOResult::Done(())) => {
+                done = true;
+                break;
+            }
+            Ok(IOResult::IO(_)) => {
+                if squeezed {
+                    assert_eq!(
+                        pager.stream_test_free_page_state(),
+                        "AddToTrunk",
+                        "state unchanged on the re-check"
+                    );
+                    let s = h.stats();
+                    assert_eq!(s.reads, reads_before, "the re-check issues no read");
+                    assert!(s.parks > parks_before, "the re-check parks");
+                    squeezed_recheck = true;
+                }
+            }
+            Err(e) => panic!("free_page failed: {e}"),
+        }
+    }
+    assert!(
+        squeezed_recheck,
+        "the yield between the Start reserve and add_dirty(trunk) was exercised"
+    );
+    assert!(done, "free_page finished after the park");
+    h.check_invariants();
+    h.exec_on(&c2, "ROLLBACK", &[]).unwrap();
+    h.integrity();
+}
+
+/// §14 fork test `update_50k_pages_fails_constraint_in_1024_slot_arena`:
+/// an UPDATE over 50k pages inside a transaction, in a 1,024-slot arena,
+/// that violates a constraint near its end. The statement fails with
+/// SQLITE_CONSTRAINT, the rollback restores 50k pre-images from scratch
+/// over many runs, the transaction stays usable, and the heap stays under
+/// the arena plus the index plus a constant.
+#[test]
+fn update_50k_pages_fails_constraint_in_1024_slot_arena() {
+    let mut h = H::open(Cfg {
+        slots: 1024,
+        count_heap: true,
+        ..Cfg::default()
+    });
+    h.fill("t", 50_000);
+    let rows = 200_000;
+    let before = h.stats();
+    h.ok("BEGIN");
+    let base = heap_reset_peak();
+    let err = h
+        .exec(&format!(
+            "UPDATE t SET n = CASE WHEN id = {} THEN NULL ELSE n + 1 END",
+            rows - 10
+        ))
+        .expect_err("NOT NULL violated near the end");
+    let peak = heap_peak() - base;
+    assert_eq!(err.sqlite_result_code(), 19, "SQLITE_CONSTRAINT, got {err}");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0, "pre-statement state");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    let s = h.stats();
+    assert!(s.records - before.records >= 49_000, "{s:?}");
+    assert!(s.restored_pages - before.restored_pages >= 49_000, "{s:?}");
+    // Arena slots are caller memory; heap: index (4 B/record) + constant.
+    let bound = 4 * 65_536 + 16 * 1024 * 1024;
+    eprintln!(
+        "update_50k: heap peak {peak} B (bound {bound}), runs {}, {s:?}",
+        h.r.runs
+    );
+    assert!(peak < bound as isize, "heap peak {peak} over {bound}");
+    h.check_invariants();
+}
