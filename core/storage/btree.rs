@@ -97,6 +97,11 @@ fn take_vec<T>(values: &mut crate::alloc::Vec<T>) -> crate::alloc::Vec<T> {
     std::mem::replace(values, crate::alloc::vec![])
 }
 
+/// A read of `group` that has not finished yet, if any.
+fn first_unfinished(group: Option<&CompletionGroup>) -> Option<Completion> {
+    group?.completions().iter().find(|c| !c.finished()).cloned()
+}
+
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
 /// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
@@ -339,6 +344,11 @@ struct BalanceState {
     /// iterations are still waited on before `NonRootDoBalancing` looks at
     /// page contents. Taken and built when the loop completes.
     sibling_load_group: Option<CompletionGroup>,
+    /// A sibling read failed while reads issued before it were still out:
+    /// the error `NonRootPickSiblings` returns once they have finished.
+    /// Waiting for them by yielding, not by blocking in the IO loop, is
+    /// what lets a sans-io caller (which cannot block) see this error.
+    sibling_load_error: Option<Box<LimboError>>,
 }
 
 impl Default for BalanceState {
@@ -349,6 +359,7 @@ impl Default for BalanceState {
             reusable_divider_buffers: std::array::from_fn(|_| crate::alloc::vec![]),
             reusable_cell_payloads: crate::alloc::vec![],
             sibling_load_group: None,
+            sibling_load_error: None,
         }
     }
 }
@@ -3676,6 +3687,7 @@ impl BTreeCursor {
                 reusable_divider_buffers,
                 reusable_cell_payloads,
                 sibling_load_group,
+                sibling_load_error,
             } = &mut self.balance_state;
             tracing::debug!(?sub_state);
 
@@ -3687,6 +3699,15 @@ impl BTreeCursor {
                     panic!("balance_non_root: unexpected state {sub_state:?}")
                 }
                 BalanceSubState::NonRootPickSiblings => {
+                    if sibling_load_error.is_some() {
+                        // A sibling read failed: wait out the reads issued
+                        // before it, then fail with its error.
+                        if let Some(c) = first_unfinished(sibling_load_group.as_ref()) {
+                            io_yield_one!(c);
+                        }
+                        *sibling_load_group = None;
+                        return Err(sibling_load_error.take().expect("checked above"));
+                    }
                     // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
                     let _ = self.move_to_right_state.1.take();
 
@@ -3835,11 +3856,16 @@ impl BTreeCursor {
                             Err(e) => {
                                 mark_unlikely();
                                 tracing::error!("error reading page {}: {}", pgno, e);
-                                // Drain any in-flight reads we accumulated
-                                // across previous iterations / yields so the
-                                // IO scheduler can finalize them before we
-                                // bail out.
-                                self.pager.io.drain_completions(group.completions())?;
+                                // Reads from earlier iterations / yields may
+                                // still be in flight. Wait for them by
+                                // yielding (re-entry returns `e` once they
+                                // are done), never by blocking in the IO
+                                // loop: a sans-io backend refuses that, and
+                                // its refusal would replace `e`.
+                                if let Some(c) = first_unfinished(Some(group)) {
+                                    *sibling_load_error = Some(e);
+                                    io_yield_one!(c);
+                                }
                                 *sibling_load_group = None;
                                 return Err(e);
                             }

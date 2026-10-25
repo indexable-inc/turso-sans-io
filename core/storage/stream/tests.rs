@@ -3568,3 +3568,312 @@ fn r6_finish_scan_keeping(
         "{what}: the scan saw a later commit"
     );
 }
+
+// ---- seeded fuzz (from the tswr13 reviewer's differential fuzz) -----------
+
+/// Mixed workload over small arenas and low credits: inserts, updates (with
+/// a trigger), deletes, savepoints with ROLLBACK TO and RELEASE, a reader on
+/// a second connection scanning across a write, writers dropped mid-opcode,
+/// and the squeeze hook. Every seed must end with integrity_check ok, no
+/// claims or pins left, nothing blocked, no add_dirty hard-rule break, no
+/// short credit, and no internal error from any statement (errors such as
+/// SQLITE_FULL or BUSY are fine).
+///
+/// `STREAM_FUZZ_SEEDS` (default 16) seeds from `STREAM_FUZZ_SEED_START`
+/// (default 0).
+mod stream_fuzz {
+    use super::*;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// What a failing seed prints: its seed and the log so far.
+    struct Seed {
+        seed: u64,
+        log: Vec<String>,
+    }
+
+    impl Drop for Seed {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                eprintln!("stream fuzz: seed {} failed; log:", self.seed);
+                for l in &self.log {
+                    eprintln!("  {l}");
+                }
+            }
+        }
+    }
+
+    pub(super) fn env_u64(name: &str, default: u64) -> u64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn internal(e: &LimboError) -> bool {
+        matches!(e, LimboError::InternalError(_))
+    }
+
+    /// `sql` on `conn` to completion, the squeeze hook as `H::exec_on` does,
+    /// without its per-statement invariant check (the seed checks it).
+    fn exec(h: &mut H, conn: &Arc<Connection>, sql: &str) -> crate::Result<Vec<Vec<Value>>> {
+        let mut stmt = h.r.run(|| conn.prepare(sql))?;
+        let mut rows = Vec::new();
+        let squeeze = h.squeeze_every;
+        for _ in 0..200_000u64 {
+            let squeeze_now = squeeze > 0 && h.r.runs % squeeze == 0;
+            let done = h.r.run(|| -> crate::Result<bool> {
+                if squeeze_now {
+                    conn.pager.load().stream_test_squeeze(None);
+                }
+                loop {
+                    match stmt.step()? {
+                        StepResult::Row => {
+                            let row = stmt.row().expect("row");
+                            rows.push(row.get_values().cloned().collect());
+                        }
+                        StepResult::Done => return Ok(true),
+                        StepResult::IO | StepResult::Yield => return Ok(false),
+                        other => panic!("unexpected step result {other:?}"),
+                    }
+                }
+            })?;
+            if done {
+                return Ok(rows);
+            }
+        }
+        panic!("no progress: {sql}");
+    }
+
+    /// The result as a log line; an internal error fails the seed.
+    fn res(sql: &str, r: crate::Result<Vec<Vec<Value>>>) -> String {
+        match r {
+            Ok(rows) => format!("ok {rows:?}"),
+            Err(e) => {
+                assert!(!internal(&e), "{sql}: internal error: {e}");
+                format!("err {} ({e})", e.sqlite_result_code())
+            }
+        }
+    }
+
+    /// `x_step`'s "other" outcome; an internal error fails the seed.
+    fn check_step(what: &str, o: &Option<String>) {
+        if let Some(o) = o {
+            assert!(!o.contains("Internal error"), "{what}: {o}");
+        }
+    }
+
+    /// Run `seed`; returns its log.
+    pub(super) fn one_seed(seed: u64) -> Vec<String> {
+        let mut g = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        // 24 slots cannot hold the setup's 40-row insert (SQLITE_FULL).
+        let slots = [32u32, 40, 48, 64, 128][g.below(5) as usize];
+        let credits = [3u32, 4, 6, 16, super::super::DEFAULT_CREDITS][g.below(5) as usize];
+        let read_delay = 1 + g.below(2);
+        let mut h = H::open(Cfg {
+            slots,
+            credits,
+            read_delay,
+            ..Cfg::default()
+        });
+        h.squeeze_every = [0u64, 0, 5, 11][g.below(4) as usize];
+        let mut s = Seed {
+            seed,
+            log: vec![format!(
+                "cfg slots={slots} credits={credits} read_delay={read_delay} squeeze={}",
+                h.squeeze_every
+            )],
+        };
+        let c0 = h.conn.clone();
+        let c1 = h.connect();
+        for sql in [
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER NOT NULL, v BLOB)",
+            "CREATE INDEX tn ON t(n)",
+            "CREATE TABLE lg(id INTEGER, n INTEGER)",
+            "CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO lg VALUES (new.id, new.n); END",
+            "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 40) \
+             SELECT i, 0, zeroblob(700) FROM c",
+        ] {
+            if let Err(e) = exec(&mut h, &c0, sql) {
+                panic!("setup {sql}: {e}");
+            }
+        }
+        let mut in_txn = false;
+        let mut sp_depth = 0;
+        let mut next_id = 1000i64;
+        for step in 0..70 {
+            h.check_invariants();
+            let op = g.below(13);
+            let a = 1 + g.below(60) as i64;
+            let b = a + g.below(12) as i64;
+            let sql: String = match op {
+                0 | 1 => {
+                    next_id += 1;
+                    let len = [10u64, 300, 900, 3000, 9000][g.below(5) as usize];
+                    format!("INSERT INTO t VALUES ({next_id}, {a}, zeroblob({len}))")
+                }
+                2 | 3 => format!("UPDATE t SET n = n + 1 WHERE id BETWEEN {a} AND {b}"),
+                4 => format!("DELETE FROM t WHERE id BETWEEN {a} AND {b}"),
+                5 if !in_txn => {
+                    in_txn = true;
+                    "BEGIN".into()
+                }
+                6 if in_txn => {
+                    sp_depth += 1;
+                    format!("SAVEPOINT s{sp_depth}")
+                }
+                7 if sp_depth > 0 => format!("ROLLBACK TO s{sp_depth}"),
+                8 if sp_depth > 0 => {
+                    let sql = format!("RELEASE s{sp_depth}");
+                    sp_depth -= 1;
+                    sql
+                }
+                9 if in_txn => {
+                    in_txn = false;
+                    sp_depth = 0;
+                    if g.below(3) == 0 {
+                        "ROLLBACK".into()
+                    } else {
+                        "COMMIT".into()
+                    }
+                }
+                10 => {
+                    // A reader on c1 scans part way, a writer runs on c0,
+                    // the reader finishes.
+                    let mut st = match h.r.run(|| c1.prepare("SELECT id, n FROM t")) {
+                        Ok(st) => st,
+                        Err(e) => {
+                            assert!(!internal(&e), "prepare scan: {e}");
+                            s.log.push(format!("{step} prepare scan: {e}"));
+                            continue;
+                        }
+                    };
+                    let (d1, r1, o1) =
+                        x_step(&mut h, &mut st, 1000, 1 + g.below(20) as usize, false);
+                    check_step("scan", &o1);
+                    let w = format!("UPDATE t SET n = n + 2 WHERE id BETWEEN {a} AND {b}");
+                    let wr = exec(&mut h, &c0, &w);
+                    let wr = res(&w, wr);
+                    let (d2, r2, o2) = x_step(&mut h, &mut st, 100_000, usize::MAX, false);
+                    check_step("scan", &o2);
+                    drop(st);
+                    s.log.push(format!(
+                        "{step} scan {d1} {} {o1:?} | {w} -> {wr} | {d2} {} {o2:?}",
+                        r1.len(),
+                        r2.len()
+                    ));
+                    continue;
+                }
+                11 => {
+                    // A writer stepped for a run or few (maybe mid-opcode),
+                    // then dropped: its claim must end with it.
+                    let w = format!(
+                        "UPDATE t SET n = n + 3, v = zeroblob(2000) WHERE id BETWEEN {a} AND {b}"
+                    );
+                    let mut st = match h.r.run(|| c0.prepare(&w)) {
+                        Ok(st) => st,
+                        Err(e) => {
+                            assert!(!internal(&e), "prepare {w}: {e}");
+                            s.log.push(format!("{step} prepare {w}: {e}"));
+                            continue;
+                        }
+                    };
+                    let (d, _, o) = x_step(&mut h, &mut st, 1 + g.below(3), usize::MAX, true);
+                    check_step(&w, &o);
+                    drop(st);
+                    s.log.push(format!("{step} {w} dropped (done {d}) {o:?}"));
+                    continue;
+                }
+                12 => "SELECT count(*), sum(n), (SELECT count(*) FROM lg) FROM t".into(),
+                _ => "SELECT count(*) FROM t WHERE n > 0".into(),
+            };
+            let r = exec(&mut h, &c0, &sql);
+            let failed = r.is_err();
+            let r = res(&sql, r);
+            if failed && in_txn && c0.get_auto_commit() {
+                // The error ended the transaction.
+                in_txn = false;
+                sp_depth = 0;
+            }
+            if g.below(4) == 0 {
+                let q = "SELECT count(*), sum(n) FROM t";
+                let rr = exec(&mut h, &c1, q);
+                let rr = res(q, rr);
+                s.log.push(format!("{step} {sql} -> {r} | c1 {rr}"));
+            } else {
+                s.log.push(format!("{step} {sql} -> {r}"));
+            }
+        }
+        if in_txn {
+            let r = exec(&mut h, &c0, "COMMIT");
+            let r = res("COMMIT", r);
+            s.log.push(format!("end COMMIT -> {r}"));
+        }
+        let q = "SELECT count(*), sum(n), (SELECT count(*) FROM lg) FROM t";
+        let fin = exec(&mut h, &c0, q);
+        let fin = res(q, fin);
+        s.log.push(format!("final {fin}"));
+        let ic = exec(&mut h, &c0, "PRAGMA integrity_check").expect("integrity_check");
+        assert!(
+            ic.len() == 1 && format!("{:?}", ic[0][0]).contains("ok"),
+            "integrity_check: {ic:?}"
+        );
+        assert!(
+            h.sdb.test_claims().is_empty(),
+            "claims left: {:?}",
+            h.sdb.test_claims()
+        );
+        assert!(
+            h.sdb.test_pins().is_empty(),
+            "pins left: {:?}",
+            h.sdb.test_pins()
+        );
+        h.check_invariants();
+        drop(c1);
+        std::mem::take(&mut s.log)
+    }
+}
+
+#[test]
+fn stream_fuzz_seeds() {
+    let start = stream_fuzz::env_u64("STREAM_FUZZ_SEED_START", 0);
+    let n = stream_fuzz::env_u64("STREAM_FUZZ_SEEDS", 16);
+    for seed in start..start + n {
+        stream_fuzz::one_seed(seed);
+    }
+}
+
+/// Review tswr13 (medium): a DELETE's rebalance whose sibling read fails
+/// (SQLITE_FULL: 32 slots) while an earlier sibling read is still in flight
+/// waited for that read with a blocking `IO::drain_completions`. Stream IO
+/// refuses to block, so the statement failed "Internal error: stream IO
+/// never blocks" in place of SQLITE_FULL. The rebalance now yields until the
+/// read is done and then fails with the read's own error. These seeds of
+/// the fuzz above hit that path, with the squeeze hook off.
+#[test]
+fn delete_rebalance_sibling_read_error_is_not_blocking() {
+    for seed in [86, 123, 180] {
+        let log = stream_fuzz::one_seed(seed);
+        assert!(
+            log.iter()
+                .any(|l| l.contains("DELETE") && l.contains("-> err 13 ")),
+            "seed {seed}: no DELETE failed SQLITE_FULL\n{}",
+            log.join("\n")
+        );
+    }
+}
