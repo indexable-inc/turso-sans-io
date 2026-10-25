@@ -44,9 +44,14 @@ pub const MAX_READ_PAGES: usize = 16;
 pub const MAX_PART_PAGES: u32 = 1024;
 /// Op credits per run unless the embedder says otherwise.
 pub const DEFAULT_CREDITS: u32 = 256;
-/// The fewest op credits a run must offer for writes to make progress: a
-/// BEGIN, a part's closing op and a read past a mutation's hold (which is
-/// at most a BEGIN and two parts' closing ops for any `R` under 1,024).
+/// The fewest op credits a run's grant must be for writes to make progress.
+/// With no transaction open a mutation holds a BEGIN and one part's closing
+/// op for its records, and a spill past that hold takes another BEGIN and
+/// closing op (the BEGIN is then shared: the hold drops it): 4. With one
+/// open the host keeps one credit for the BEGIN until the COMMIT (ABI.md
+/// "Transactions span runs"), leaving 3 for a hold of 1 plus a read, a
+/// spill's closing op or the commit's last part and COMMIT. Reads in flight
+/// hold credits too; they come back as the reads complete.
 pub const MIN_CREDITS: u32 = 4;
 /// First stream page of the scratch region (subjournal records). It is the
 /// tail of every transaction's page range, never part of the database.
@@ -156,6 +161,9 @@ pub struct StreamStats {
     /// Transactions aborted because a rollback or a staged part could not
     /// finish (the statement got SQLITE_FULL or SQLITE_IOERR).
     pub doomed: u64,
+    /// Times a statement waited for a run whose credits cover what its
+    /// claim's records will stage (or a read on top of the holds).
+    pub credit_waits: u64,
 }
 
 pub(crate) enum Pending {
@@ -166,15 +174,41 @@ pub(crate) enum Pending {
     Pin(u64),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PinState {
+    /// No PIN went out yet (it goes out at the first read at the version).
+    #[default]
+    Unsent,
+    /// The PIN went out and its completion has not come back. If the last
+    /// holder leaves meanwhile the entry stays, and the completion decides:
+    /// UNPIN after a success, nothing after a refusal (the host never
+    /// pinned it, and an UNPIN of an unpinned version is `Invalid`).
+    Pending,
+    /// The PIN landed: the last holder's release sends UNPIN.
+    Held,
+    /// The PIN was refused (`TRIMMED`): reads at the version fail
+    /// SQLITE_BUSY, and no UNPIN goes out for it.
+    Lost,
+}
+
 #[derive(Default)]
 struct Pin {
     holders: u32,
-    /// The PIN op went out (at the first read at this version).
-    sent: bool,
-    /// The PIN failed: the version is gone. Reads at it fail
-    /// SQLITE_BUSY, and no UNPIN goes out for it.
-    lost: bool,
+    state: PinState,
 }
+
+/// What one statement (`owner`) on one connection was promised by a
+/// reserve: fresh arena slots, and subjournal records whose stages need op
+/// credits. Keyed by (connection, owner), so a statement ending clears only
+/// its own claim, never another statement's or another connection's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Claim {
+    pub(crate) slots: u32,
+    pub(crate) records: u32,
+}
+
+/// (connection id, statement id).
+pub(crate) type ClaimKey = (u64, u64);
 
 struct Txn {
     id: u32,
@@ -195,10 +229,11 @@ struct Inner {
     next_tag: u64,
     /// Op credits left in this run.
     credits: u32,
-    /// Credits promised to the writer's current mutation (its subjournal
-    /// records, `stream_reserve`). Reads and spills leave them alone; the
-    /// record stages use them. Never above `credits`.
-    hold: u32,
+    /// Every statement's reservation. The slots they claim are kept free
+    /// from everyone else; the credits their records' stages will take
+    /// (`held`) are kept from reads and spills.
+    claims: BTreeMap<ClaimKey, Claim>,
+    next_conn: u64,
     notify: Option<(u64, Completion)>,
     /// Unstaged writes in the open transaction's current part. While it is
     /// above 0 the credit of the op that closes the part (its STAGE, or the
@@ -225,8 +260,6 @@ struct Inner {
     stats: StreamStats,
     /// The database size in pages, last seen in a loaded page 1 (0: never).
     size_hint: u32,
-    /// Arena slots promised to mutations, over every connection.
-    reserved_slots: u32,
 }
 
 /// The op list and the state every connection of one database shares.
@@ -271,7 +304,8 @@ impl StreamDb {
                 pending: HashMap::new(),
                 next_tag: 1,
                 credits: DEFAULT_CREDITS,
-                hold: 0,
+                claims: BTreeMap::new(),
+                next_conn: 1,
                 notify: None,
                 part_writes: 0,
                 batch_writes: 0,
@@ -285,7 +319,6 @@ impl StreamDb {
                 keep: Vec::new(),
                 stats: StreamStats::default(),
                 size_hint: 0,
-                reserved_slots: 0,
             }),
             caches: Mutex::new(Vec::new()),
         })
@@ -325,7 +358,6 @@ impl StreamDb {
     pub fn begin_run(&self, credits: u32, quota_pages: u64) {
         let mut g = self.inner.lock();
         g.credits = credits;
-        g.hold = g.hold.min(credits);
         g.quota_left = quota_pages;
         g.stats.runs += 1;
     }
@@ -349,12 +381,26 @@ impl StreamDb {
             }
             Some(Pending::Notify(c)) => c.complete(0),
             Some(Pending::Pin(v)) => {
+                let mut g = self.inner.lock();
+                let Some(p) = g.pins.get_mut(&v) else {
+                    return;
+                };
+                let orphan = p.holders == 0;
                 if result < 0 {
                     // The version is gone; only statements reading at it
-                    // fail (SQLITE_BUSY), the handle is fine.
-                    if let Some(p) = self.inner.lock().pins.get_mut(&v) {
-                        p.lost = true;
+                    // fail (SQLITE_BUSY), the handle is fine. Nothing was
+                    // pinned, so nothing is unpinned.
+                    p.state = PinState::Lost;
+                    if orphan {
+                        g.pins.remove(&v);
                     }
+                } else if orphan {
+                    // Every holder left while the PIN was in flight: let go
+                    // now that the host holds it.
+                    g.pins.remove(&v);
+                    Self::push_unpin(&mut g, v);
+                } else {
+                    p.state = PinState::Held;
                 }
             }
             None => {
@@ -439,10 +485,28 @@ impl StreamDb {
         self.inner.lock().credits
     }
 
-    /// Credits a read or a spill may use: what is left past the hold.
+    /// Credits a read or a spill may use: what is left past the holds.
     pub(crate) fn free_credits(&self) -> u32 {
         let g = self.inner.lock();
-        g.credits.saturating_sub(g.hold)
+        g.credits.saturating_sub(Self::held(&g))
+    }
+
+    /// Credits kept for the claimed records' stages: a BEGIN if no
+    /// transaction is open (none once one is), and the closing op of every
+    /// part they open. The open part's room is not counted: a `Latest`
+    /// read may stage that part first.
+    fn held(g: &Inner) -> u32 {
+        let records: u64 = g.claims.values().map(|c| u64::from(c.records)).sum();
+        if records == 0 {
+            return 0;
+        }
+        Self::hold_for(g, records)
+    }
+
+    fn hold_for(g: &Inner, records: u64) -> u32 {
+        let writes = records + u64::from(g.pending_discard.is_some());
+        let begin = u32::from(g.txn.is_none());
+        begin + u32::try_from(writes.div_ceil(u64::from(MAX_PART_PAGES))).unwrap_or(u32::MAX)
     }
 
     /// Take `n` credits for an op the caller was promised (or checked
@@ -453,7 +517,6 @@ impl StreamDb {
             return Err(full());
         }
         g.credits -= n;
-        g.hold = g.hold.min(g.credits);
         Ok(())
     }
 
@@ -479,14 +542,9 @@ impl StreamDb {
         Self::credits_for(&self.inner.lock(), writes)
     }
 
-    /// Credits to hold for `writes` record stages that happen later in a
-    /// mutation: like `stage_credits`, but the open part's room is not
-    /// counted, since a read (`Latest`) may stage that part before then.
-    pub(crate) fn hold_credits(&self, writes: u64) -> u32 {
-        let g = self.inner.lock();
-        let writes = writes + u64::from(g.pending_discard.is_some());
-        let begin = u32::from(g.txn.is_none());
-        begin + u32::try_from(writes.div_ceil(u64::from(MAX_PART_PAGES))).unwrap_or(u32::MAX)
+    /// Credits every claim's records hold, now (see [`Self::held`]).
+    pub(crate) fn held_credits(&self) -> u32 {
+        Self::held(&self.inner.lock())
     }
 
     /// Writes that `budget` credits can stage now.
@@ -508,16 +566,87 @@ impl StreamDb {
         writes.saturating_sub(u64::from(g.pending_discard.is_some()))
     }
 
-    /// Promise `n` credits to the writer's mutation (replaces the hold).
-    pub(crate) fn set_hold(&self, n: u32) {
+    // ---- claims: what each statement's reserve was promised -------------
+
+    /// A new connection's id for its claim keys.
+    pub(crate) fn new_conn(&self) -> u64 {
         let mut g = self.inner.lock();
-        g.hold = n.min(g.credits);
+        let id = g.next_conn;
+        g.next_conn += 1;
+        id
     }
 
-    /// Promise at least `n` credits (a nested reserve inside a mutation).
-    pub(crate) fn raise_hold(&self, n: u32) {
+    pub(crate) fn claim(&self, key: ClaimKey) -> Claim {
+        self.inner
+            .lock()
+            .claims
+            .get(&key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Replace `key`'s claim (an empty one is removed).
+    pub(crate) fn set_claim(&self, key: ClaimKey, c: Claim) {
         let mut g = self.inner.lock();
-        g.hold = g.hold.max(n).min(g.credits);
+        if c == Claim::default() {
+            g.claims.remove(&key);
+        } else {
+            g.claims.insert(key, c);
+        }
+    }
+
+    /// One of `key`'s claimed slots (`slot`) or records was used.
+    pub(crate) fn use_claim(&self, key: ClaimKey, slot: bool, record: bool) {
+        let mut g = self.inner.lock();
+        let Some(c) = g.claims.get_mut(&key) else {
+            return;
+        };
+        if slot {
+            c.slots = c.slots.saturating_sub(1);
+        }
+        if record {
+            c.records = c.records.saturating_sub(1);
+        }
+        if *c == Claim::default() {
+            g.claims.remove(&key);
+        }
+    }
+
+    /// Drop `key`'s claim: its statement ended.
+    pub(crate) fn clear_claim(&self, key: ClaimKey) {
+        self.inner.lock().claims.remove(&key);
+    }
+
+    /// Drop every claim of connection `conn` (its transaction ended, or it
+    /// closed).
+    pub(crate) fn clear_conn_claims(&self, conn: u64) {
+        self.inner.lock().claims.retain(|k, _| k.0 != conn);
+    }
+
+    /// Records claimed over every statement (quota they will take).
+    pub(crate) fn claimed_records(&self) -> u64 {
+        let g = self.inner.lock();
+        g.claims.values().map(|c| u64::from(c.records)).sum()
+    }
+
+    /// Can `key`'s claimed records all stage in this run? (The open part's
+    /// room counts: nothing but this statement's own records goes into it
+    /// while reads see no free credit.) Counted when not.
+    pub(crate) fn claim_short(&self, key: ClaimKey) -> bool {
+        let mut g = self.inner.lock();
+        let records = g.claims.get(&key).map_or(0, |c| c.records);
+        if records == 0 {
+            return false;
+        }
+        let short = g.credits < Self::credits_for(&g, u64::from(records));
+        if short {
+            g.stats.credit_waits += 1;
+        }
+        short
+    }
+
+    pub(crate) fn bump_credit_wait(&self) {
+        self.inner.lock().stats.credit_waits += 1;
     }
 
     // ---- slots shared by every connection --------------------------------
@@ -556,14 +685,10 @@ impl StreamDb {
         n
     }
 
+    /// Arena slots claimed over every statement of every connection.
     pub(crate) fn reserved_slots(&self) -> u32 {
-        self.inner.lock().reserved_slots
-    }
-
-    /// One connection's reservation went from `old` to `new` slots.
-    pub(crate) fn move_reserved(&self, old: u32, new: u32) {
-        let mut g = self.inner.lock();
-        g.reserved_slots = (g.reserved_slots + new).saturating_sub(old);
+        let g = self.inner.lock();
+        g.claims.values().map(|c| c.slots).sum()
     }
 
     /// A completion finished at the start of the next run (the store's
@@ -583,7 +708,17 @@ impl StreamDb {
 
     /// Credits a read at `at` takes now (the read, and a pin first).
     fn read_need(g: &Inner, at: ReadAt) -> u32 {
-        1 + u32::from(matches!(at, ReadAt::Version(v) if !g.pins.get(&v).is_some_and(|p| p.sent)))
+        1 + u32::from(matches!(at, ReadAt::Version(v) if Self::pin_unsent(g, v)))
+    }
+
+    fn pin_unsent(g: &Inner, v: u64) -> bool {
+        g.pins.get(&v).is_none_or(|p| p.state == PinState::Unsent)
+    }
+
+    /// Can a read at `at` go out now, past every hold?
+    pub(crate) fn can_read(&self, at: ReadAt) -> bool {
+        let g = self.inner.lock();
+        g.credits >= Self::read_need(&g, at) + Self::held(&g)
     }
 
     /// Issue a read of one page (`page` is the stream page) into `buf`.
@@ -598,13 +733,13 @@ impl StreamDb {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
         if let ReadAt::Version(v) = at {
-            if g.pins.get(&v).is_some_and(|p| p.lost) {
+            if g.pins.get(&v).is_some_and(|p| p.state == PinState::Lost) {
                 // The snapshot is gone: this statement fails SQLITE_BUSY.
                 return Err(LimboError::CompletionError(CompletionError::SnapshotLost));
             }
         }
         let need = Self::read_need(&g, at);
-        if g.credits < need + g.hold {
+        if g.credits < need + Self::held(&g) {
             return Ok(None);
         }
         match at {
@@ -627,7 +762,7 @@ impl StreamDb {
                 }
             }
             ReadAt::Version(v) => {
-                if !g.pins.get(&v).is_some_and(|p| p.sent) {
+                if Self::pin_unsent(&g, v) {
                     Self::take_credits(&mut g, 1)?;
                     let tag = g.next_tag;
                     g.next_tag += 1;
@@ -638,7 +773,7 @@ impl StreamDb {
                         ..Default::default()
                     });
                     g.pending.insert(tag, Pending::Pin(v));
-                    g.pins.entry(v).or_default().sent = true;
+                    g.pins.entry(v).or_default().state = PinState::Pending;
                     g.stats.pins += 1;
                 }
             }
@@ -678,19 +813,59 @@ impl StreamDb {
             return;
         };
         p.holders = p.holders.saturating_sub(1);
-        if p.holders == 0 {
-            let unpin = p.sent && !p.lost;
-            g.pins.remove(&v);
-            if unpin {
-                // UNPIN needs no credit (it never completes, and a guest
-                // must always be able to let go).
-                g.ops.push(StreamOp {
-                    kind: op::UNPIN,
-                    at: v,
-                    ..Default::default()
-                });
-            }
+        if p.holders > 0 {
+            return;
         }
+        match p.state {
+            PinState::Unsent | PinState::Lost => {
+                g.pins.remove(&v);
+            }
+            PinState::Held => {
+                g.pins.remove(&v);
+                Self::push_unpin(&mut g, v);
+            }
+            // The completion decides (see `PinState::Pending`).
+            PinState::Pending => {}
+        }
+    }
+
+    /// UNPIN needs no credit (it never completes, and a guest must always
+    /// be able to let go).
+    fn push_unpin(g: &mut Inner, v: u64) {
+        g.ops.push(StreamOp {
+            kind: op::UNPIN,
+            at: v,
+            ..Default::default()
+        });
+    }
+
+    /// Test hook: the credit state, for a stuck test's message.
+    #[cfg(test)]
+    pub(crate) fn test_credit_state(&self) -> String {
+        let g = self.inner.lock();
+        format!(
+            "credits {} held {} txn {} part_writes {} pending_discard {:?} claims {:?} pins {:?}",
+            g.credits,
+            Self::held(&g),
+            g.txn.is_some(),
+            g.part_writes,
+            g.pending_discard,
+            g.claims,
+            g.pins
+                .iter()
+                .map(|(v, p)| (*v, p.holders, p.state))
+                .collect::<Vec<_>>()
+        )
+    }
+
+    /// Test hook: (version, holders, PIN in flight) of every pin entry.
+    #[cfg(test)]
+    pub(crate) fn test_pins(&self) -> Vec<(u64, u32, bool)> {
+        let g = self.inner.lock();
+        g.pins
+            .iter()
+            .map(|(v, p)| (*v, p.holders, p.state == PinState::Pending))
+            .collect()
     }
 
     /// Database size in pages last seen by any connection (0: unknown).

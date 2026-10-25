@@ -1032,6 +1032,9 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// Stream storage: this statement's id in claim keys (see
+    /// `Pager::stream_set_owner`). Unique over the process.
+    stream_owner: u64,
     pub io_completions: Option<IOCompletions>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
@@ -1222,9 +1225,12 @@ impl ProgramState {
             .map(|_| Register::Value(Value::Null))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        static NEXT_STREAM_OWNER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            stream_owner: NEXT_STREAM_OWNER.fetch_add(1, Ordering::Relaxed),
             io_completions: None,
             extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
@@ -1772,9 +1778,9 @@ impl ProgramState {
             );
             self.is_active_write = false;
         }
-        // Stream storage: the statement's slot reservation and held credits
-        // end with it.
-        pager.stream_end_statement();
+        // Stream storage: the statement's claim (slots and held credits)
+        // ends with it, and nobody else's does.
+        pager.stream_end_statement(self.stream_owner);
         // A write statement that keeps its changes must have applied them to
         // the materialized views first (see
         // `Program::maintain_views_for_kept_changes`). Everything left in the
@@ -2576,6 +2582,11 @@ impl Program {
                         None => continue 'io_check,
                     }
                 }
+                if pager.is_stream() {
+                    if let Some(result) = program.stream_step_gate(state, pager, waker) {
+                        return result;
+                    }
+                }
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
@@ -2867,6 +2878,23 @@ impl Program {
             crate::stack::trace_remaining("program_step:opcode");
         }
         self.trace_registers(state, insn, vdbe_trace);
+    }
+
+    /// Stream storage, at every step: the reserves this step makes are
+    /// this statement's, and a statement whose claim's records this run's
+    /// credits can't stage waits for a run that can (before it runs
+    /// anything, so it resumes where it was).
+    #[cold]
+    #[inline(never)]
+    fn stream_step_gate(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Option<ProgramStep> {
+        pager.stream_set_owner(state.stream_owner);
+        let c = pager.stream_resume_gate()?;
+        self.park_on_io(state, IOCompletions(c), waker)
     }
 
     /// An instruction that waits for IO: the statement parks on it and

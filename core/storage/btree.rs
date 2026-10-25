@@ -1282,7 +1282,26 @@ impl BTreeNodeState {
 
 impl BTreeCursor {
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
-        Self::new_with_index_info(pager, root_page, num_columns, None)
+        let usable_space = pager.usable_space();
+        Self::new_with_index_info(pager, root_page, num_columns, None, usable_space)
+    }
+
+    /// [`BTreeCursor::new`] that fails instead of panicking when the page's
+    /// usable space is unknown (stream storage: see
+    /// [`Pager::try_usable_space`]). Callers on the stream path use it.
+    pub fn try_new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Result<Self> {
+        let usable_space = pager.try_usable_space()?;
+        Ok(Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            None,
+            usable_space,
+        ))
+    }
+
+    pub fn try_new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Result<Self> {
+        Self::try_new(pager, root_page, num_columns)
     }
 
     fn new_with_index_info(
@@ -1290,13 +1309,13 @@ impl BTreeCursor {
         root_page: i64,
         _num_columns: usize,
         index_info: Option<Arc<IndexInfo>>,
+        usable_space: usize,
     ) -> Self {
         let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
             CursorValidState::Valid
         };
-        let usable_space = pager.usable_space();
         Self {
             pager,
             root_page,
@@ -1370,6 +1389,35 @@ impl BTreeCursor {
         table: &BTreeTable,
         num_columns: usize,
     ) -> Self {
+        let usable_space = pager.usable_space();
+        Self::without_rowid_table(pager, root_page, table, num_columns, usable_space)
+    }
+
+    /// [`BTreeCursor::new_without_rowid_table`] that fails instead of
+    /// panicking (see [`BTreeCursor::try_new`]).
+    pub fn try_new_without_rowid_table(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+    ) -> Result<Self> {
+        let usable_space = pager.try_usable_space()?;
+        Ok(Self::without_rowid_table(
+            pager,
+            root_page,
+            table,
+            num_columns,
+            usable_space,
+        ))
+    }
+
+    fn without_rowid_table(
+        pager: Arc<Pager>,
+        root_page: i64,
+        table: &BTreeTable,
+        num_columns: usize,
+        usable_space: usize,
+    ) -> Self {
         let key_info = table.primary_key_columns.iter().map(|(col_name, order)| {
             let (_, column) = table
                 .get_column(col_name)
@@ -1384,7 +1432,13 @@ impl BTreeCursor {
             IndexInfo::new(key_info, false, table.primary_key_columns.len(), true)
                 .expect(crate::alloc::ALLOC_ERR_MSG),
         );
-        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+            usable_space,
+        )
     }
 
     pub fn new_index(
@@ -1394,11 +1448,13 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Self> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
+        let usable_space = pager.try_usable_space()?;
         Ok(Self::new_with_index_info(
             pager,
             root_page,
             num_columns,
             Some(index_info),
+            usable_space,
         ))
     }
 
@@ -1409,7 +1465,15 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+        let usable_space = pager.try_usable_space()?;
+        Ok(Self::new_with_index_info(
+            pager,
+            root_page,
+            num_columns,
+            Some(index_info),
+            usable_space,
+        )
+        .into_boxed())
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
@@ -1663,7 +1727,9 @@ impl BTreeCursor {
                 );
                 // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
                 let next = state.page.get_contents().read_u32_no_offset(0);
-                let to_read = state.remaining_to_read.min(self.pager.usable_space() - 4);
+                let to_read = state
+                    .remaining_to_read
+                    .min(self.pager.try_usable_space()? - 4);
                 (
                     next,
                     to_read,
@@ -5872,7 +5938,7 @@ impl BTreeCursor {
 
         return_if_io!(self.pager.stream_check_page(root_page));
         self.pager.add_dirty(root_page)?;
-        btree_init_page(root_page, page_type, 0, self.pager.usable_space());
+        btree_init_page(root_page, page_type, 0, self.pager.try_usable_space()?);
         Ok(IOResult::Done(()))
     }
 
@@ -8568,7 +8634,7 @@ pub fn integrity_check(
             continue;
         }
 
-        let usable_space = pager.usable_space();
+        let usable_space = pager.try_usable_space()?;
         let mut coverage_checker = CoverageChecker::new(page.get().id() as i64);
 
         // Now we check every cell for few things:

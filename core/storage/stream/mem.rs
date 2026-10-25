@@ -14,8 +14,14 @@
 //! transaction had not written before, a batch debits every write, and
 //! commit (pages a later part discarded) or abort refunds. An overdraft is
 //! a guest bug and panics. The runner passes what is left as each run's
-//! `quota_pages`, and checks that a run never issues more credited ops
-//! (READ, PIN, BEGIN, STAGE, COMMIT, BATCH) than its credits.
+//! `quota_pages`.
+//!
+//! Credits are the host's: each run reports the grant minus the credited
+//! ops (READ, PIN, STAGE with notify) still in flight, minus one while a
+//! transaction is open (BEGIN "takes the credit the commit will use"), and
+//! checks that the run issues no more credited ops (READ, PIN, BEGIN,
+//! STAGE, COMMIT, BATCH) than that. An UNPIN of a version this stream has
+//! not pinned panics, as the host fails it `Invalid`.
 
 use super::{op, StreamDb, StreamOp, FLAG_AT_VERSION, FLAG_NOTIFY, PAGE_SIZE};
 use crate::sync::Arc;
@@ -97,6 +103,8 @@ struct Due {
     tag: u64,
     result: i64,
     copy: Option<(u64, PageBytes)>,
+    /// Holds a credit until it completes.
+    credited: bool,
 }
 
 /// The store side of one stream, in memory.
@@ -197,7 +205,19 @@ impl MemStore {
             tag,
             result,
             copy,
+            credited: true,
         });
+    }
+
+    /// Credits the store holds now: credited ops in flight, plus one per
+    /// open transaction.
+    pub fn held_credits(&self) -> u32 {
+        (self.due.iter().filter(|d| d.credited).count() + self.txns.len()) as u32
+    }
+
+    /// Versions pinned now, with their pin counts.
+    pub fn pins(&self) -> &HashMap<u64, u32> {
+        &self.pins
     }
 
     fn commit(&mut self, v: u64, writes: impl IntoIterator<Item = (u64, Version)>) {
@@ -243,11 +263,13 @@ impl MemStore {
                 }
             }
             op::UNPIN => {
-                if let Some(n) = self.pins.get_mut(&o.at) {
-                    *n -= 1;
-                    if *n == 0 {
-                        self.pins.remove(&o.at);
-                    }
+                let n = self
+                    .pins
+                    .get_mut(&o.at)
+                    .unwrap_or_else(|| panic!("UNPIN of version {} not pinned", o.at));
+                *n -= 1;
+                if *n == 0 {
+                    self.pins.remove(&o.at);
                 }
             }
             op::BEGIN => {
@@ -334,7 +356,10 @@ impl MemStore {
                     self.refund(t.debited.len() as u64);
                 }
             }
-            op::NOTIFY => self.complete_later(o.tag, 0, 0, None),
+            op::NOTIFY => {
+                self.complete_later(o.tag, 0, 0, None);
+                self.due.last_mut().expect("just pushed").credited = false;
+            }
             k => panic!("unknown stream op kind {k}"),
         }
     }
@@ -376,6 +401,9 @@ pub struct MemRunner {
     pub credits: u32,
     ops: Vec<StreamOp>,
     pub runs: u64,
+    /// Runs whose reported credits were below the grant (the store held
+    /// some).
+    pub short_runs: u64,
     /// Called with `true` when guest code starts running and `false` when
     /// the store's does (heap accounting in tests).
     pub scope: fn(bool),
@@ -389,6 +417,7 @@ impl MemRunner {
             credits: super::DEFAULT_CREDITS,
             ops: Vec::new(),
             runs: 0,
+            short_runs: 0,
             scope: |_| {},
         }
     }
@@ -397,10 +426,12 @@ impl MemRunner {
     /// store, give lent slots back.
     pub fn run<T>(&mut self, f: impl FnOnce() -> T) -> T {
         self.runs += 1;
-        self.db.begin_run(self.credits, self.store.quota_pages());
         (self.scope)(false);
         let due = self.store.take_due();
+        let credits = self.credits.saturating_sub(self.store.held_credits());
+        self.short_runs += u64::from(credits < self.credits);
         (self.scope)(true);
+        self.db.begin_run(credits, self.store.quota_pages());
         for (tag, res) in due {
             self.db.complete(tag, res);
         }
@@ -418,8 +449,8 @@ impl MemRunner {
             })
             .count();
         assert!(
-            credited <= self.credits as usize,
-            "run {} issued {credited} credited ops with {} credits",
+            credited <= credits as usize,
+            "run {} issued {credited} credited ops with {credits} credits (grant {})",
             self.runs,
             self.credits
         );

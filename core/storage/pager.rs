@@ -3085,7 +3085,7 @@ impl Pager {
             page.get_contents().offset(),
             "offset doesn't match computed offset for page"
         );
-        btree_init_page(&page, page_type, offset, self.usable_space());
+        btree_init_page(&page, page_type, offset, self.try_usable_space()?);
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id(),
@@ -3098,13 +3098,15 @@ impl Pager {
     /// in the header, minus the "reserved" space size recorded in the 1-byte integer at offset 20 in the header.
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
+    ///
+    /// Stream mode: off the stream path only (every caller on it uses
+    /// [`Pager::try_usable_space`], which returns the error this panics
+    /// with).
     pub fn usable_space(&self) -> usize {
         if self.is_stream() {
-            // No header IO and no guessed default in stream mode: page size
-            // and reserved bytes are known from open (or page-1 init).
             return self
                 .stream_usable_space()
-                .unwrap_or_else(|e| panic!("stream usable_space: {e}"));
+                .unwrap_or_else(|e| panic!("stream usable_space off the stream path: {e}"));
         }
         let page_size = self.get_page_size().unwrap_or_else(|| {
             let size = self
@@ -3131,6 +3133,17 @@ impl Pager {
         });
 
         (page_size.get() as usize) - (reserved_space as usize)
+    }
+
+    /// [`Pager::usable_space`] that fails instead of panicking. Stream mode
+    /// never does header IO or guesses a default: page size and reserved
+    /// bytes are known from open (or page-1 init), and a database where they
+    /// aren't (a fork bug) fails the statement rather than trapping.
+    pub fn try_usable_space(&self) -> Result<usize> {
+        if self.is_stream() {
+            return self.stream_usable_space();
+        }
+        Ok(self.usable_space())
     }
 
     pub fn db_initialized(&self) -> bool {
@@ -3725,19 +3738,21 @@ impl Pager {
             {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx as usize);
-                let mut hit = page_cache.get(&page_key)?;
-                if self.is_stream()
-                    && hit
-                        .as_ref()
-                        .is_some_and(|p| !p.is_loaded() && !p.is_locked())
-                {
-                    // Its stream read failed (the error went to the reader
-                    // that issued it): read again rather than wait forever.
-                    drop(page_cache);
-                    let failed = hit.take().expect("checked above");
-                    self.stream_drop_failed_read(&failed);
-                    page_cache = self.page_cache.write();
+                if self.is_stream() {
+                    let failed = page_cache
+                        .peek(&page_key, false)
+                        .filter(|p| !p.is_loaded() && !p.is_locked());
+                    if let Some(failed) = failed {
+                        // Its stream read failed (the error went to the
+                        // reader that issued it): drop it and read again
+                        // rather than wait forever; a page that can't be
+                        // dropped fails this access (or dooms the txn).
+                        drop(page_cache);
+                        self.stream_take_failed_read(&failed)?;
+                        page_cache = self.page_cache.write();
+                    }
                 }
+                let hit = page_cache.get(&page_key)?;
                 if let Some(page) = hit {
                     turso_assert!(
                         page_idx as usize == page.get().id(),

@@ -110,6 +110,10 @@ impl Wal for StreamWal {
         false
     }
 
+    fn stream_read_at(&self) -> Option<ReadAt> {
+        Some(self.read_at())
+    }
+
     fn begin_write_tx(&self, _allowed: WalAutoActions) -> Result<()> {
         if self.writing.load(Ordering::Acquire) {
             return Ok(());

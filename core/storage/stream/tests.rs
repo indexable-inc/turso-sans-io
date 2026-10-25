@@ -253,8 +253,10 @@ impl H {
         }
         let pager = conn.pager.load().clone();
         panic!(
-            "statement made no progress after {MAX_RUNS} runs: {sql}\n{:?}\nslots {:?}, free_page {}, due {}",
+            "statement made no progress after {MAX_RUNS} runs: {sql}\n{:?}\n{}\nstore holds {}\nslots {:?}, free_page {}, due {}",
             self.stats(),
+            self.sdb.test_credit_state(),
+            self.r.store.held_credits(),
             self.sdb.pool().page_slots(),
             pager.stream_test_free_page_state(),
             self.r.store.has_due()
@@ -858,5 +860,254 @@ fn low_credits_and_shrinking_grant() {
     assert_eq!(h.one("SELECT sum(n) FROM t"), 80);
     h.ok("UPDATE t SET n = 0");
     assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+    // The runner reported the grant less the held BEGIN and the reads in
+    // flight, as the host does (round-2 M2: the writer used to park
+    // forever at the minimum once it did).
+    assert!(
+        h.r.short_runs > 0,
+        "no run saw fewer credits than the grant"
+    );
+}
+
+// ---- round-2 review --------------------------------------------------------
+
+/// A standalone database over its own arena (no SQL), for op-level tests.
+fn bare(slots: u32, quota: u64) -> (Arc<StreamDb>, MemArena) {
+    let mut arena = MemArena::new(slots);
+    let db = unsafe {
+        StreamDb::new(
+            arena.base(),
+            slots,
+            0,
+            StreamConfig {
+                scratch_pages: 1024,
+                quota_pages: quota,
+            },
+        )
+    };
+    (db, arena)
+}
+
+fn page_buf(db: &StreamDb) -> Arc<crate::io::Buffer> {
+    Arc::new(db.pool().try_get_page().expect("a free slot"))
+}
+
+/// Round-2 H1: a reader's statement, and a sibling statement on the
+/// writer's own connection, finishing between the writer's yields leave
+/// the writer's claim (slots and held credits) alone. Every run steps the
+/// writer's UPDATE and the other statement, as a guest's scheduler does.
+#[test]
+fn other_statements_ending_keep_the_writers_claim() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        credits: super::MIN_CREDITS,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let reader = h.connect();
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    let mut update = h.r.run(|| conn.prepare("UPDATE t SET n = n + 1")).unwrap();
+    // (statement, its connection is the writer's, rows seen)
+    let mut other: Option<(crate::Statement, bool, i64)> = None;
+    let (mut ended, mut sibling_ended) = (0u32, 0u32);
+    let mut update_done = false;
+    for i in 0.. {
+        assert!(i < MAX_RUNS, "no progress: {}", h.sdb.test_credit_state());
+        let step = |s: &mut crate::Statement, rows: &mut i64| -> bool {
+            loop {
+                match s.step().expect("step") {
+                    StepResult::Row => *rows += 1,
+                    StepResult::Done => return true,
+                    StepResult::IO | StepResult::Yield => return false,
+                    o => panic!("unexpected step result {o:?}"),
+                }
+            }
+        };
+        let finished = h.r.run(|| {
+            if !update_done {
+                update_done = step(&mut update, &mut 0);
+            }
+            if other.is_none() && !update_done {
+                let sibling = (ended + sibling_ended) % 2 == 1;
+                let (c, sql) = if sibling {
+                    (&conn, "SELECT count(*) FROM t WHERE id <= 8")
+                } else {
+                    (&reader, "SELECT count(*) FROM t")
+                };
+                other = Some((c.prepare(sql).expect("prepare"), sibling, 0));
+            }
+            if let Some((s, sibling, rows)) = other.as_mut() {
+                if step(s, rows) {
+                    assert_eq!(*rows, 1);
+                    if *sibling {
+                        sibling_ended += 1;
+                    } else {
+                        ended += 1;
+                    }
+                    other = None;
+                }
+            }
+            update_done && other.is_none()
+        });
+        h.check_invariants();
+        if finished {
+            break;
+        }
+    }
+    drop(update);
+    assert!(
+        ended > 0 && sibling_ended > 0,
+        "statements ended mid-update: reader {ended}, sibling {sibling_ended}"
+    );
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    let rows = h.exec_on(&reader, "SELECT sum(n) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 400);
+    h.integrity();
+}
+
+/// Round-2 M1: the last holder of a version leaving while its PIN is in
+/// flight sends UNPIN only once the PIN succeeds; a PIN refused (the
+/// version trimmed) is never unpinned. The store panics on an UNPIN of a
+/// version it did not pin.
+#[test]
+fn release_while_pin_in_flight_unpins_only_after_success() {
+    for trimmed in [false, true] {
+        let (db, _arena) = bare(16, u64::MAX / 2);
+        let mut store = MemStore::new();
+        store.read_delay = 0;
+        if trimmed {
+            store.trimmed_below = 1;
+        }
+        let mut r = MemRunner::new(db.clone(), store);
+        let page = Arc::new(crate::storage::pager::Page::new(1));
+        r.run(|| {
+            db.hold(0);
+            let buf = page_buf(&db);
+            let c = super::wal::page_read_completion(page.clone(), 1, buf.clone());
+            let issued = db.read(super::ReadAt::Version(0), 0, &buf, c).unwrap();
+            assert!(issued.is_some(), "the read goes out");
+            db.keep(buf);
+            db.release(0);
+            assert_eq!(db.test_pins(), vec![(0, 0, true)], "the PIN decides");
+        });
+        assert_eq!(r.store.pins().len(), usize::from(!trimmed));
+        // The PIN's completion lands: success lets go, LOST forgets.
+        r.run(|| {});
+        assert!(db.test_pins().is_empty(), "trimmed={trimmed}");
+        r.run(|| {});
+        assert!(
+            r.store.pins().is_empty(),
+            "trimmed={trimmed}: {:?}",
+            r.store.pins()
+        );
+    }
+}
+
+/// Round-2 C2: cancelling a batch after the page-1 init committed in the
+/// same run keeps the init's WRITE and BATCH, and gives back only the
+/// cancelled writes' quota and credit.
+#[test]
+fn batch_cancel_keeps_the_page1_init() {
+    let (db, _arena) = bare(16, 100);
+    db.begin_run(16, 100);
+    let p1 = page_buf(&db);
+    assert!(db.batch_write(0, &p1).unwrap());
+    assert_eq!(db.batch_commit().unwrap(), 1);
+    let (a, b) = (page_buf(&db), page_buf(&db));
+    assert!(db.batch_write(1, &a).unwrap());
+    assert!(db.batch_write(2, &b).unwrap());
+    db.batch_cancel();
+    assert_eq!(db.quota_left(), 99, "only the init's page is spent");
+    assert_eq!(db.credits(), 15, "only the init's BATCH credit is spent");
+    let mut ops = Vec::new();
+    db.take_ops(&mut ops);
+    let kinds: Vec<(u32, u64)> = ops.iter().map(|o| (o.kind, o.page)).collect();
+    assert_eq!(kinds, vec![(super::op::WRITE, 0), (super::op::BATCH, 0)]);
+    assert_eq!(ops[1].at, 1);
+    drop(ops);
+    db.release_run();
+}
+
+/// Round-2 C8: a read that fails to go out (the handle failed) unlocks
+/// the page it locked.
+#[test]
+fn read_frame_error_unlocks_the_page() {
+    use crate::storage::wal::Wal;
+    let (db, _arena) = bare(16, u64::MAX / 2);
+    db.begin_run(16, u64::MAX / 2);
+    // A write-side op failing fails the handle closed.
+    db.complete(999, super::err::IO);
+    let wal = super::wal::StreamWal::new(db.clone());
+    let page = Arc::new(crate::storage::pager::Page::new(1));
+    let res = wal.read_frame(1, page.clone(), db.pool().clone(), None);
+    assert!(res.is_err(), "the failed handle refuses the read");
+    assert!(!page.is_locked(), "the page is unlocked again");
+    db.release_run();
+}
+
+/// Round-2 C9: a second `begin_read_tx` across a head move holds only
+/// the new version; `end_read_tx` lets go of it.
+#[test]
+fn begin_read_tx_twice_moves_the_hold() {
+    use crate::storage::wal::Wal;
+    let (db, _arena) = bare(16, u64::MAX / 2);
+    db.begin_run(16, u64::MAX / 2);
+    let wal = super::wal::StreamWal::new(db.clone());
+    wal.begin_read_tx().unwrap();
+    assert_eq!(db.test_pins(), vec![(0, 1, false)]);
+    let p1 = page_buf(&db);
+    assert!(db.batch_write(0, &p1).unwrap());
+    assert_eq!(db.batch_commit().unwrap(), 1);
+    assert!(wal.begin_read_tx().unwrap(), "the head moved");
+    assert_eq!(db.test_pins(), vec![(1, 1, false)], "only the new version");
+    wal.end_read_tx();
+    assert!(db.test_pins().is_empty());
+    let mut ops = Vec::new();
+    db.take_ops(&mut ops);
+    assert!(
+        ops.iter().all(|o| o.kind != super::op::UNPIN),
+        "nothing was pinned"
+    );
+    drop(ops);
+    db.release_run();
+}
+
+/// Round-2 C7 (spec case): the store's quota refuses the spill a
+/// savepoint restore needs. The transaction is doomed and aborted on the
+/// store, the statement fails SQLITE_FULL, and nothing of it commits.
+#[test]
+fn quota_refusing_a_restore_spill_dooms_the_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        quota: 100_000,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    let before = h.stats();
+    h.r.store.allowance = Some(0);
+    let res = h
+        .exec("ROLLBACK TO a")
+        .and_then(|_| h.exec("SELECT sum(n) FROM t"));
+    let err = res.expect_err("the restore cannot spill");
+    assert!(is_full(&err), "expected SQLITE_FULL, got {err}");
+    let s = h.stats();
+    assert!(
+        s.doomed > before.doomed && s.aborts > before.aborts,
+        "{s:?}"
+    );
+    assert!(h.conn.get_auto_commit(), "the transaction was rolled back");
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    h.r.store.allowance = Some(100_000);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
     h.integrity();
 }

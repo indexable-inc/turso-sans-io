@@ -29,17 +29,24 @@
 //!   slots, quota, scratch and op credits it will need are there, at a point
 //!   where it can still return IO; `add_dirty` itself never waits, and if it
 //!   finds no slot it fails SQLITE_FULL (and counts it) rather than use the
-//!   heap. Slot reservations are counted over every connection, and the
-//!   credits a mutation's records will stage are held from reads and spills.
+//!   heap. A reserve is a claim of the statement that made it (keyed by
+//!   connection and statement, so one statement ending never clears
+//!   another's): its slots are kept from every connection, and the credits
+//!   its records will stage are held from reads and spills. A statement
+//!   whose claim's records could not stage in this run (a later run's
+//!   grant is smaller, or reads in flight hold credits) waits at its next
+//!   step instead of staging them short.
 
 use super::*;
 use crate::storage::stream::{
-    self, ReadAt, StreamDb, MAX_PART_PAGES, MAX_READ_PAGES, SCRATCH_BASE,
+    self, Claim, ClaimKey, ReadAt, StreamDb, MAX_PART_PAGES, MAX_READ_PAGES, SCRATCH_BASE,
 };
 use crate::storage::wal::Wal;
 
 pub(crate) struct StreamPager {
     pub(crate) db: Arc<StreamDb>,
+    /// This connection's id in claim keys.
+    conn: u64,
     st: Mutex<StreamPagerState>,
 }
 
@@ -47,9 +54,9 @@ pub(crate) struct StreamPager {
 struct StreamPagerState {
     /// Record `i` (scratch page `SCRATCH_BASE + i`) holds this db page.
     index: Vec<u32>,
-    /// Slots the current mutation was promised (see `stream_reserve`); also
-    /// counted in the database's total over every connection.
-    reserved: u32,
+    /// The statement stepping now (its claims are `(conn, owner)`); set at
+    /// every step. 0: no statement (open, connect).
+    owner: u64,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
@@ -91,8 +98,10 @@ struct Restore {
 
 impl StreamPager {
     pub(crate) fn new(db: Arc<StreamDb>) -> Self {
+        let conn = db.new_conn();
         Self {
             db,
+            conn,
             st: Mutex::new(StreamPagerState::default()),
         }
     }
@@ -100,9 +109,8 @@ impl StreamPager {
 
 impl Drop for StreamPager {
     fn drop(&mut self) {
-        // A connection closed mid-mutation gives its slots back.
-        let reserved = self.st.lock().reserved;
-        self.db.move_reserved(reserved, 0);
+        // A connection closed mid-mutation gives its slots and credits back.
+        self.db.clear_conn_claims(self.conn);
     }
 }
 
@@ -151,16 +159,36 @@ impl Pager {
             }
         }
         db.txn_abort();
-        self.stream_set_reserved(0);
-        db.set_hold(0);
+        // The transaction is gone: so is every claim made for it.
+        db.clear_conn_claims(self.sp().conn);
         e
     }
 
-    fn stream_set_reserved(&self, n: u32) {
-        let mut st = self.sp().st.lock();
-        let old = st.reserved;
-        st.reserved = n;
-        self.sp().db.move_reserved(old, n);
+    /// The claim key of the statement stepping now.
+    fn stream_key(&self) -> ClaimKey {
+        let sp = self.sp();
+        (sp.conn, sp.st.lock().owner)
+    }
+
+    /// The statement `owner` is stepping (every step sets it): reserves and
+    /// the slots and records they promise are its own.
+    pub fn stream_set_owner(&self, owner: u64) {
+        if let Some(sp) = &self.stream {
+            sp.st.lock().owner = owner;
+        }
+    }
+
+    /// At a statement's step, before it runs anything: if its claim holds
+    /// records that this run's credits could not stage (a run after the
+    /// one that reserved them, with a smaller grant or reads in flight),
+    /// wait for a run that can. The reserve checked them only in its own
+    /// run.
+    pub fn stream_resume_gate(&self) -> Option<Completion> {
+        let sp = self.stream.as_ref()?;
+        if !sp.db.claim_short(self.stream_key()) {
+            return None;
+        }
+        Some(sp.db.park())
     }
 
     /// Would `add_dirty(page)` write a subjournal record?
@@ -276,18 +304,18 @@ impl Pager {
         if self.stream.is_none() {
             return Ok(IOResult::Done(()));
         }
-        self.stream_set_reserved(0);
-        self.sp().db.set_hold(0);
+        self.sp().db.clear_claim(self.stream_key());
         let records = if self.has_savepoint() { slots } else { 0 };
         self.stream_reserve(slots, records)
     }
 
-    /// The statement ended: its reservation (slots and held credits) is
-    /// over. Reserves are an upper bound, so some are always left.
-    pub(crate) fn stream_end_statement(&self) {
-        if self.stream.is_some() {
-            self.stream_set_reserved(0);
-            self.sp().db.set_hold(0);
+    /// Statement `owner` ended: its claim (slots and held credits) is over.
+    /// Reserves are an upper bound, so some are always left. Only its own:
+    /// another statement on this connection, or any statement of another
+    /// connection, keeps what it was promised.
+    pub(crate) fn stream_end_statement(&self, owner: u64) {
+        if let Some(sp) = &self.stream {
+            sp.db.clear_claim((sp.conn, owner));
         }
     }
 
@@ -298,6 +326,11 @@ impl Pager {
     pub(crate) fn stream_reserve(&self, slots: u32, records: u32) -> IOResultOr<()> {
         return_if_io!(self.stream_gate());
         let db = self.sp().db.clone();
+        let key = self.stream_key();
+        let own = db.claim(key);
+        // A nested reserve (free_page inside an opcode's) asks for part of
+        // what the outer one claimed: the claim is the larger of the two.
+        let records = records.max(own.records);
         if records > 0 {
             if self.records_used() + records > db.config().scratch_pages {
                 db.bump(|s| {
@@ -306,7 +339,8 @@ impl Pager {
                 });
                 return Err(stream::full().into());
             }
-            if db.quota_left() < records as u64 {
+            let others = db.claimed_records() - u64::from(own.records);
+            if db.quota_left() < others + u64::from(records) {
                 db.bump(|s| {
                     s.quota_full += 1;
                     s.reserve_full += 1;
@@ -314,16 +348,20 @@ impl Pager {
                 return Err(stream::full().into());
             }
         }
-        let want = slots.max(self.sp().st.lock().reserved);
+        let want = slots.max(own.slots);
         return_if_io!(self.stream_ensure_slots(want));
-        self.stream_set_reserved(want);
-        if records > 0 {
-            // BEGIN, and the closing op of each part the records open.
-            let need = db.hold_credits(records as u64);
-            if db.credits() < need {
-                io_yield_one!(db.park());
-            }
-            db.raise_hold(need);
+        db.set_claim(
+            key,
+            Claim {
+                slots: want,
+                records,
+            },
+        );
+        // BEGIN (until one is open) and the closing op of each part the
+        // records open, over every claim.
+        if records > 0 && db.credits() < db.held_credits() {
+            db.bump_credit_wait();
+            io_yield_one!(db.park());
         }
         Ok(IOResult::Done(()))
     }
@@ -341,12 +379,9 @@ impl Pager {
         self.stream_reserve(slots, records)
     }
 
-    /// One fresh slot of the reserve was used.
-    fn stream_take_reserved(&self) {
-        let r = self.sp().st.lock().reserved;
-        if r > 0 {
-            self.stream_set_reserved(r - 1);
-        }
+    /// One fresh slot of the claim was used, and a record if `record`.
+    fn stream_take_reserved(&self, record: bool) {
+        self.sp().db.use_claim(self.stream_key(), true, record);
     }
 
     /// At least `n` free slots for this connection on top of what the other
@@ -356,7 +391,7 @@ impl Pager {
         let db = self.sp().db.clone();
         let pool = db.pool().clone();
         let (total, free, _) = pool.page_slots();
-        let own = self.sp().st.lock().reserved;
+        let own = db.claim(self.stream_key()).slots;
         let others = db.reserved_slots().saturating_sub(own);
         let want = n.saturating_add(others);
         if free >= want {
@@ -419,15 +454,20 @@ impl Pager {
         Ok(n)
     }
 
-    /// Spill what the free credits (past the hold) allow, at most one part.
-    /// No subjournal record is written at spill: records are taken at
-    /// `add_dirty`, before the page changes, and a staged part is only ever
-    /// overwritten by a later one, never rewound.
+    /// Spill what the free credits (past the holds) and the quota (past
+    /// what the claimed records will take) allow, at most one part. Every
+    /// page is counted as new to the escrow, so a spill never takes quota a
+    /// claimed record needs, and never meets a refusal it would have to
+    /// doom the transaction for. No subjournal record is written at spill:
+    /// records are taken at `add_dirty`, before the page changes, and a
+    /// staged part is only ever overwritten by a later one, never rewound.
     fn stream_spill(&self) -> Result<u32> {
         let db = &self.sp().db;
+        let quota = db.quota_left().saturating_sub(db.claimed_records());
         let room = db
             .writes_within(db.free_credits())
-            .min(MAX_PART_PAGES as u64) as usize;
+            .min(MAX_PART_PAGES as u64)
+            .min(quota) as usize;
         if room == 0 {
             return Ok(0);
         }
@@ -444,15 +484,22 @@ impl Pager {
     }
 
     /// Before a cache miss: no restore pending, credits for the read (and a
-    /// pin) past the hold, a slot for it on top of every reservation.
+    /// pin, if its version has none yet) past the holds, a slot for it on
+    /// top of every claim.
     pub(super) fn stream_before_miss(&self) -> IOResultOr<()> {
         return_if_io!(self.stream_gate());
         let db = &self.sp().db;
-        if db.free_credits() < 2 {
+        let at = self
+            .wal
+            .as_ref()
+            .and_then(|w| w.stream_read_at())
+            .unwrap_or(ReadAt::Latest);
+        if !db.can_read(at) {
+            db.bump_credit_wait();
             io_yield_one!(db.park());
         }
-        let reserved = self.sp().st.lock().reserved;
-        self.stream_ensure_slots(1 + reserved)
+        let own = db.claim(self.stream_key()).slots;
+        self.stream_ensure_slots(1 + own)
     }
 
     /// `add_dirty` in stream mode, before the page is marked dirty: write
@@ -515,7 +562,7 @@ impl Pager {
             // may still look at them.
             db.keep(old);
         }
-        self.stream_take_reserved();
+        self.stream_take_reserved(rec_at.is_some());
         Ok(())
     }
 
@@ -524,7 +571,7 @@ impl Pager {
         let db = &self.sp().db;
         match db.pool().try_get_page() {
             Some(b) => {
-                self.stream_take_reserved();
+                self.stream_take_reserved(false);
                 Ok(b)
             }
             None => {
@@ -620,9 +667,8 @@ impl Pager {
     ) -> Result<()> {
         self.reset_internal_states();
         let db = self.sp().db.clone();
-        // A mutation that was going on is over.
-        self.stream_set_reserved(0);
-        db.set_hold(0);
+        // The mutation of the statement rolling back is over.
+        db.clear_claim(self.stream_key());
         if self.doomed_error().is_some() {
             // The transaction is gone; its rollback restores nothing.
             return Ok(());
@@ -715,7 +761,9 @@ impl Pager {
     pub(super) fn stream_commit(&self) -> IOResultOr<()> {
         return_if_io!(self.stream_gate());
         let db = self.sp().db.clone();
-        db.set_hold(0);
+        // The transaction is ending: its statements' claims are over (an
+        // autocommit statement commits before its own end).
+        db.clear_conn_claims(self.sp().conn);
         let mut pages = Vec::new();
         {
             let dirty = self.dirty_pages.read();
@@ -807,8 +855,7 @@ impl Pager {
             st.index.clear();
             st.restore = None;
         }
-        self.stream_set_reserved(0);
-        self.sp().db.set_hold(0);
+        self.sp().db.clear_conn_claims(self.sp().conn);
     }
 
     /// The write transaction rolled back (whole).
@@ -820,8 +867,7 @@ impl Pager {
                 st.restore = None;
                 st.doomed = None;
             }
-            self.stream_set_reserved(0);
-            sp.db.set_hold(0);
+            sp.db.clear_conn_claims(sp.conn);
         }
     }
 
@@ -880,12 +926,26 @@ impl Pager {
 
     /// A cached page whose stream read failed (unloaded, not locked):
     /// drop it so the next access reads again instead of waiting forever.
-    pub(super) fn stream_drop_failed_read(&self, page: &PageRef) -> bool {
+    /// A page that can't be dropped is never read again over itself: a
+    /// dirty one (a restore's page) lost bytes the transaction needs, which
+    /// dooms it; a pinned one is still someone's, which fails this access.
+    pub(super) fn stream_take_failed_read(&self, page: &PageRef) -> Result<()> {
         if page.is_loaded() || page.is_locked() {
-            return false;
+            return Ok(());
         }
-        let key = PageCacheKey::new(page.get().id());
-        self.page_cache.write().delete(key).is_ok()
+        let id = page.get().id();
+        match self.page_cache.write().delete(PageCacheKey::new(id)) {
+            Ok(()) => Ok(()),
+            Err(CacheError::Dirty { .. }) => Err(self.stream_doom(LimboError::CompletionError(
+                CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "stream: a dirty page's read failed",
+                ),
+            ))),
+            Err(e) => Err(LimboError::InternalError(format!(
+                "stream: page {id} failed its read and can't be dropped: {e:?}"
+            ))),
+        }
     }
 
     /// Test hook: `free_page`'s state, as a name.

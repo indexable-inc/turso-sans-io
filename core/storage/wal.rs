@@ -631,6 +631,12 @@ pub trait Wal: Debug + Send + Sync {
     /// MVCC helper: check if WAL state changed without starting a read tx.
     fn mvcc_refresh_if_db_changed(&self) -> bool;
 
+    /// Stream storage: the version this connection's next page read reads
+    /// at. `None` for every other WAL.
+    fn stream_read_at(&self) -> Option<crate::storage::stream::ReadAt> {
+        None
+    }
+
     /// Begin a write transaction.
     ///
     /// `allowed_auto_actions` controls which automatic WAL maintenance

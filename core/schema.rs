@@ -1804,7 +1804,7 @@ impl Schema {
                         .into());
                     }
 
-                    state.cursor = Some(BTreeCursor::new_table(Arc::clone(pager), 1, 10));
+                    state.cursor = Some(BTreeCursor::try_new_table(Arc::clone(pager), 1, 10)?);
                     pager.begin_read_tx()?;
                     state.read_tx_active = true;
 
@@ -1963,8 +1963,11 @@ impl Schema {
                         state.sequence_sources.pop();
                         continue;
                     }
-                    let cursor =
-                        BTreeCursor::new_table(pager.clone(), source.root_page, source.num_columns);
+                    let cursor = BTreeCursor::try_new_table(
+                        pager.clone(),
+                        source.root_page,
+                        source.num_columns,
+                    )?;
                     state.sequence_cursor = Some(cursor);
                     let cursor = state.sequence_cursor.as_mut().expect("just set");
                     return_if_io!(cursor.rewind());
