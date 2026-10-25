@@ -5842,7 +5842,7 @@ impl BTreeCursor {
                         destroy_info.state = DestroyState::ProcessPage;
                     } else {
                         if keep_root {
-                            self.clear_root(&page)?;
+                            return_if_io!(self.clear_root(&page));
                         } else {
                             return_if_io!(self.pager.free_page(Some(page), page_id));
                         }
@@ -5860,7 +5860,9 @@ impl BTreeCursor {
         }
     }
 
-    fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
+    /// Empty the root page of a b-tree that is kept (`ClearBtree`). Returns
+    /// IO when the stream pager first needs a slot or a record for it.
+    fn clear_root(&mut self, root_page: &PageRef) -> IOResultOr<()> {
         let contents = root_page.get_contents();
 
         let page_type = match contents.page_type()? {
@@ -5868,9 +5870,10 @@ impl BTreeCursor {
             PageType::IndexLeaf | PageType::IndexInterior => PageType::IndexLeaf,
         };
 
+        return_if_io!(self.pager.stream_check_page(root_page));
         self.pager.add_dirty(root_page)?;
         btree_init_page(root_page, page_type, 0, self.pager.usable_space());
-        Ok(())
+        Ok(IOResult::Done(()))
     }
 
     /// True iff the cursor sits cleanly on a row: valid, positioned, and not mid-way

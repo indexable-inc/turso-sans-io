@@ -691,6 +691,8 @@ pub struct Database<
     wal_path: String,
     pub io: Arc<dyn IO>,
     pub(crate) buffer_pool: Arc<BufferPool>,
+    /// Set when the database lives on a store stream (`storage::stream`).
+    pub(crate) stream: Option<Arc<crate::storage::stream::StreamDb>>,
     // Shared structures of a Database are the parts that are common to multiple threads that might
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
@@ -807,6 +809,7 @@ impl Database {
         let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
+        let stream = db_file.stream_db();
 
         let db_size = db_file.size()?;
 
@@ -854,7 +857,11 @@ impl Database {
             io: io.clone(),
             open_flags: flags,
             opts,
-            buffer_pool: BufferPool::begin_init(io, arena_size),
+            buffer_pool: match &stream {
+                Some(s) => s.pool().clone(),
+                None => BufferPool::begin_init(io, arena_size),
+            },
+            stream,
             n_connections: AtomicUsize::new(0),
             incarnation: {
                 // Deliberately std, not crate::sync: this static outlives a
@@ -2609,11 +2616,17 @@ impl Database {
             // before reading page 1. This is required for reopening encrypted databases.
             Arc::new(self._init(encryption_key.as_ref(), page_codec.clone())?)
         };
-        let default_cache_size = pager
-            .io
-            .block(|| pager.with_header(|header| header.default_page_cache_size))
-            .unwrap_or_default()
-            .get();
+        let default_cache_size = if pager.is_stream() {
+            // The arena bounds the cache; reading the header here would
+            // block (and on the stream nothing may).
+            Default::default()
+        } else {
+            pager
+                .io
+                .block(|| pager.with_header(|header| header.default_page_cache_size))
+                .unwrap_or_default()
+        }
+        .get();
 
         let conn = self.new_connection(
             is_mvcc_bootstrap_connection,
@@ -3236,6 +3249,11 @@ impl Database {
         last_checksum_and_max_frame: ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Arc<dyn Wal>> {
+        if let Some(stream) = &self.stream {
+            return Ok(Arc::new(crate::storage::stream::StreamWal::new(
+                stream.clone(),
+            )));
+        }
         #[cfg(host_shared_wal)]
         if let Some(authority) = self.shared_wal_coordination()? {
             return Ok(Arc::new(WalFile::new_with_shared_coordination(
@@ -3349,14 +3367,22 @@ impl Database {
             None
         };
 
-        let pager = Pager::new(
+        let page_cache = match &self.stream {
+            // The arena bounds what is resident, not the cache.
+            Some(s) => PageCache::new_spilling(s.pool().page_slots().0 as usize),
+            None => PageCache::default(),
+        };
+        let mut pager = Pager::new(
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
-            PageCache::default(),
+            page_cache,
             buffer_pool,
             self.pager_state.clone(),
         )?;
+        if let Some(s) = &self.stream {
+            pager.set_stream(s.clone());
+        }
         if self.initialized() {
             pager.set_page_size(page_size);
         }

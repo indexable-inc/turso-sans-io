@@ -13022,6 +13022,24 @@ fn normalize_table_change_record(
     Ok(values)
 }
 
+/// Stream storage, reserve-before-mutate (streams-guest-api §14 change 4):
+/// before a b-tree mutation, make the slots it can dirty free (and, under a
+/// savepoint, check its records fit), while the opcode can still wait.
+/// `payload` is the record size, for overflow pages.
+fn stream_reserve(
+    state: &mut ProgramState,
+    pager: &Pager,
+    payload: usize,
+) -> Result<Option<InsnFunctionStepResult>, Box<LimboError>> {
+    if !pager.is_stream() {
+        return Ok(None);
+    }
+    match pager.stream_reserve_op(pager.stream_op_slots(payload))? {
+        IOResult::Done(()) => Ok(None),
+        IOResult::IO(io) => Ok(Some(state.suspend_on_io(io))),
+    }
+}
+
 pub fn op_insert(
     program: &Program,
     state: &mut ProgramState,
@@ -13042,6 +13060,15 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
+                if pager.is_stream() {
+                    let payload = match &state.registers[*record_reg] {
+                        Register::Record(r) => r.as_blob().len(),
+                        _ => 0,
+                    };
+                    if let Some(r) = stream_reserve(state, pager, payload)? {
+                        return Ok(r);
+                    }
+                }
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, *cursor_id)?
                 } else {
@@ -13491,7 +13518,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         Delete {
@@ -13505,6 +13532,9 @@ pub fn op_delete(
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
+                if let Some(r) = stream_reserve(state, pager, 0)? {
+                    return Ok(r);
+                }
                 let route = if program.prepared().has_materialized_views {
                     change_log_route(program, state, *cursor_id)?
                 } else {
@@ -13671,6 +13701,9 @@ pub fn op_idx_delete(
         );
         match state.active_op_state.idx_delete() {
             OpIdxDeleteState::Seeking => {
+                if let Some(r) = stream_reserve(state, pager, 0)? {
+                    return Ok(r);
+                }
                 let found = match seek_internal(
                     program,
                     state,
@@ -13793,6 +13826,21 @@ pub fn op_idx_insert(
         state.record_rows_written(1);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
+    }
+
+    if pager.is_stream()
+        && matches!(
+            *state.active_op_state.idx_insert(),
+            OpIdxInsertState::MaybeSeek
+        )
+    {
+        let payload = match &state.registers[record_reg] {
+            Register::Record(r) => r.as_blob().len(),
+            _ => 0,
+        };
+        if let Some(r) = stream_reserve(state, pager, payload)? {
+            return Ok(r);
+        }
     }
 
     let record_to_insert = match &state.registers[record_reg] {
@@ -16935,7 +16983,13 @@ pub fn op_open_ephemeral(
                 Arc::new(DatabaseFile::new(temp_file.file.clone()));
             let db_file_io: Arc<dyn crate::IO> = io;
 
-            let buffer_pool = program.connection.db.buffer_pool.clone();
+            let buffer_pool = if program.connection.db.buffer_pool.is_strict() {
+                // A stream database's pool is the guest arena and hands out
+                // only its slots; ephemeral tables use their own heap pool.
+                crate::storage::buffer_pool::BufferPool::new_heap(page_size.get() as usize)
+            } else {
+                program.connection.db.buffer_pool.clone()
+            };
 
             let pager = Arc::new(Pager::new(
                 db_file,

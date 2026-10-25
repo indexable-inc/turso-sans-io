@@ -130,6 +130,13 @@ pub trait DatabaseStorage: Send + Sync {
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion>;
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: usize, c: Completion) -> Result<Completion>;
+
+    /// The stream database behind this storage, when it is a
+    /// [`crate::storage::stream::StreamStorage`]: the open path then uses
+    /// the stream's arena, `StreamWal` and the stream pager.
+    fn stream_db(&self) -> Option<Arc<crate::storage::stream::StreamDb>> {
+        None
+    }
 }
 
 #[derive(Clone)]

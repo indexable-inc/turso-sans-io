@@ -72,6 +72,8 @@ const PENDING_BYTE: u32 = 0x40000000;
 #[cfg(feature = "autovacuum")]
 use ptrmap::*;
 
+mod stream_ext;
+
 #[derive(Debug, Clone)]
 pub struct HeaderRef(PageRef);
 
@@ -94,6 +96,7 @@ pub struct HeaderRefMut(PageRef);
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> IOResultOr<Self> {
         let page = return_if_io!(pager.read_header_page());
+        return_if_io!(pager.stream_check_page(&page));
         pager.add_dirty(&page)?;
         Ok(IOResult::Done(Self(page)))
     }
@@ -1696,6 +1699,8 @@ pub struct Pager {
     /// The boxes are the point: each one is a cursor-sized allocation.
     #[allow(clippy::vec_box)]
     cursor_allocations: Mutex<Vec<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>>>,
+    /// Set when the pages live in a store stream (`storage::stream`).
+    stream: Option<stream_ext::StreamPager>,
 }
 
 /// Retired record buffers kept per pager. Each holds a page-sized allocation.
@@ -1991,6 +1996,7 @@ impl Pager {
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
             record_pool: Mutex::new(Vec::new()),
             cursor_allocations: Mutex::new(Vec::new()),
+            stream: None,
         })
     }
 
@@ -2338,6 +2344,7 @@ impl Pager {
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(savepoint.write_offset());
         } else {
+            self.stream_truncate_records(0);
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
                 return Ok(());
@@ -2411,6 +2418,7 @@ impl Pager {
         if let Some(parent) = savepoints.last() {
             parent.set_write_offset(journal_end_offset);
         } else {
+            self.stream_truncate_records(0);
             let subjournal = self.subjournal.read();
             let Some(subjournal) = subjournal.as_ref() else {
                 return Ok(result);
@@ -2424,6 +2432,7 @@ impl Pager {
 
     pub fn clear_savepoints(&self) -> Result<()> {
         *self.savepoints.write() = Vec::new();
+        self.stream_truncate_records(0);
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -2548,6 +2557,9 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         journal_end_offset: u64,
     ) -> Result<()> {
+        if self.stream.is_some() {
+            return self.stream_rollback_to_snapshot(savepoint, journal_end_offset);
+        }
         self.reset_internal_states();
 
         let subjournal = self.subjournal.read();
@@ -3682,6 +3694,9 @@ impl Pager {
         if self.spill_yield.should_yield_for(page_idx) {
             io_yield_one!(crate::Completion::new_yield());
         }
+        if self.stream.is_some() {
+            return_if_io!(self.stream_gate());
+        }
         let pending = if self.has_pending_reads.load(Ordering::Acquire) {
             self.pending_reads.read().get(&page_idx).cloned()
         } else {
@@ -3716,6 +3731,11 @@ impl Pager {
                         // locked, unloaded page with nothing to wait on: a torn
                         // / uninitialized read, or a concurrent writer filling
                         // the buffer underneath the reader.
+                        if let Some(db) = self.stream_db() {
+                            // Its read completes in a later run: wait for it
+                            // there, not by spinning in this one.
+                            io_yield_one!(db.park());
+                        }
                         io_yield_one!(crate::Completion::new_yield());
                     }
                     return Ok(IOResult::Done((page, None)));
@@ -3723,6 +3743,9 @@ impl Pager {
             }
 
             tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+            if self.stream.is_some() {
+                return_if_io!(self.stream_before_miss());
+            }
             let (page, c) = self.read_page_no_cache(page_idx, None, false, group)?;
             self.insert_pending_read(
                 page_idx,
@@ -3789,6 +3812,15 @@ impl Pager {
     /// read (mirroring SQLite, where `cache_size` may be exceeded while all
     /// pages are in use); later inserts drain the excess.
     fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
+        if self.stream.is_some() {
+            // The slot was made free before the read; the cache never
+            // decides capacity in stream mode, the arena does.
+            let mut page_cache = self.page_cache.write();
+            return match page_cache.force_insert_page(PageCacheKey::new(page_idx), page) {
+                Ok(_) | Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                Err(e) => Err(LimboError::from(e).into()),
+            };
+        }
         {
             let mut page_cache = self.page_cache.write();
             let page_key = PageCacheKey::new(page_idx);
@@ -3911,7 +3943,11 @@ impl Pager {
             "page must be loaded in add_dirty() so its contents can be subjournaled",
             { "page_id": page.get().id() }
         );
-        self.subjournal_page_if_required(page)?;
+        if self.stream.is_some() {
+            self.stream_prepare_dirty(page)?;
+        } else {
+            self.subjournal_page_if_required(page)?;
+        }
         let mut dirty_pages = self.dirty_pages.write();
         dirty_pages.insert(page.get().id() as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
@@ -4472,6 +4508,9 @@ impl Pager {
     /// Check if the cache needs spilling and attempt to spill if necessary.
     /// This should be called before inserting new pages into the cache.
     fn ensure_cache_space(&self) -> IOResultOr<()> {
+        if self.stream.is_some() {
+            return Ok(IOResult::Done(()));
+        }
         let needs_spill = {
             let cache = self.page_cache.read();
             cache.needs_spill()
@@ -4513,6 +4552,9 @@ impl Pager {
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
+        if self.stream.is_some() {
+            return self.stream_commit();
+        }
         {
             let mut commit_info = self.commit_info.write();
             if commit_info.state == CommitState::PrepareWal {
@@ -5557,6 +5599,16 @@ impl Pager {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
+        if self.stream.is_some() && matches!(*self.free_page_state.read(), FreePageState::Start) {
+            // Page 1 and the page or trunk this call dirties (§14 change 4,
+            // free_page at Start, before HeaderRefMut).
+            let records = if self.page_has_savepoint_for_stream() {
+                2
+            } else {
+                0
+            };
+            return_if_io!(self.stream_reserve(2, records));
+        }
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
 
@@ -5632,6 +5684,10 @@ impl Pager {
                         }
                     }
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
+                    // F5: the read above may have yielded, and whatever took
+                    // slots meanwhile may have taken the one this add_dirty
+                    // needs. Re-check with the state unchanged.
+                    return_if_io!(self.stream_check_page(&trunk_page));
 
                     let trunk_page_contents = trunk_page.get_contents();
                     let number_of_leaf_pages =
@@ -5666,6 +5722,7 @@ impl Pager {
                 }
                 FreePageState::NewTrunk { page } => {
                     turso_assert!(page.is_loaded(), "page should be loaded");
+                    return_if_io!(self.stream_check_page(page));
                     // If we get here, need to make this page a new trunk
                     turso_assert!(page.get().id() == page_id, "page has unexpected id");
                     self.add_dirty(page)?;
@@ -5724,7 +5781,7 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool);
+                let page = self.new_page(1)?;
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -5744,6 +5801,11 @@ impl Pager {
                 // The page cache never evicts or spills page 1, so an
                 // ephemeral pager never reads it back from its file.
                 if self.ephemeral.load(Ordering::Relaxed) {
+                    page1.pin();
+                    return self.finish_allocate_page1(page1);
+                }
+                if self.stream.is_some() {
+                    self.stream_write_page1(&page1)?;
                     page1.pin();
                     return self.finish_allocate_page1(page1);
                 }
@@ -5801,6 +5863,24 @@ impl Pager {
         Ok(IOResult::Done(page))
     }
 
+    /// A new loaded page `page_id`. In stream mode its buffer is an arena
+    /// slot or nothing (SQLITE_FULL), never the heap (§14 change 5).
+    fn new_page(&self, page_id: i64) -> Result<PageRef> {
+        if self.stream.is_some() {
+            let buffer = self.stream_new_buffer()?;
+            let page = Arc::new(Page::new(page_id));
+            page.get().set_buffer(Arc::new(buffer));
+            page.set_loaded();
+            page.clear_wal_tag();
+            return Ok(page);
+        }
+        Ok(allocate_new_page(page_id, &self.buffer_pool))
+    }
+
+    fn page_has_savepoint_for_stream(&self) -> bool {
+        self.subjournal.read().is_some() && !self.savepoints.read().is_empty()
+    }
+
     pub fn allocating_page1(&self) -> bool {
         matches!(
             *self.allocate_page1_state.read(),
@@ -5820,6 +5900,15 @@ impl Pager {
     pub fn allocate_page(&self) -> IOResultOr<PageRef> {
         // Ensure cache has room before allocating (we may spill dirty pages first)
         return_if_io!(self.ensure_cache_space());
+        if self.stream.is_some() {
+            // Page 1, plus the new page's slot (or a trunk/leaf record).
+            let records = if self.page_has_savepoint_for_stream() {
+                2
+            } else {
+                0
+            };
+            return_if_io!(self.stream_reserve(2, records));
+        }
 
         let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
         let header = header_ref.borrow_mut();
@@ -5861,7 +5950,7 @@ impl Pager {
                                 cache.contains_key(&page_key)
                             };
                             if !already_present {
-                                let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                                let page = self.new_page(new_db_size as i64)?;
                                 self.add_dirty(&page)?;
                                 self.page_cache.write().force_insert_page(page_key, page)?;
                             }
@@ -5892,6 +5981,7 @@ impl Pager {
                         "Freelist trunk page is not loaded",
                         { "page_id": trunk_page.get().id() }
                     );
+                    return_if_io!(self.stream_check_page(trunk_page));
                     let page_contents = trunk_page.get_contents();
                     let next_trunk_page_id =
                         page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR);
@@ -5973,6 +6063,13 @@ impl Pager {
                         "Leaf page is not loaded",
                         { "page_id": leaf_page.get().id() }
                     );
+                    if self.stream.is_some() {
+                        let (a, ra) = self.stream_need(leaf_page);
+                        let (b, rb) = self.stream_need(trunk_page);
+                        if a + b > 0 {
+                            return_if_io!(self.stream_reserve(a + b, ra + rb));
+                        }
+                    }
                     let page_contents = trunk_page.get_contents();
                     self.add_dirty(leaf_page)?;
                     if !leaf_page.get_contents().overflow_cells.is_empty() {
@@ -6024,12 +6121,15 @@ impl Pager {
                     return Ok(IOResult::Done(leaf_page));
                 }
                 AllocatePageState::AllocateNewPage { current_db_size } => {
+                    if self.stream.is_some() {
+                        // The new page's slot (and the pending-byte page's).
+                        return_if_io!(self.stream_ensure_slots(2));
+                    }
                     let mut new_db_size = *current_db_size + 1;
 
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
-                        let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                        let richard_hipp_special_page = self.new_page(new_db_size as i64)?;
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id());
                         self.page_cache
@@ -6046,7 +6146,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
+                    let page = self.new_page(new_db_size as i64)?;
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
@@ -6147,6 +6247,7 @@ impl Pager {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }
+            self.stream_on_rollback();
         }
     }
 
