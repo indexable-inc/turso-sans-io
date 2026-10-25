@@ -694,7 +694,8 @@ impl<'a> WriteBatch<'a> {
     }
 
     /// Submit all writes. Returns completions caller must wait on. Each
-    /// write is added to `group`, when given, before it is submitted.
+    /// write is submitted as a child of `group`, when given, through
+    /// `CompletionGroup::submit`, so a refused write is not left in it.
     #[inline]
     pub fn submit(self, mut group: Option<&mut CompletionGroup>) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
@@ -709,10 +710,10 @@ impl<'a> WriteBatch<'a> {
                     "pwritev wrote {bytes_written} bytes, expected {total_len}"
                 );
             });
-            if let Some(group) = group.as_deref_mut() {
-                group.add(&c);
-            }
-            completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
+            let c = CompletionGroup::submit(group.as_deref_mut(), c, |c| {
+                self.file.pwritev(pos, bufs.to_vec(), c)
+            })?;
+            completions.push(c);
         }
         Ok(completions)
     }

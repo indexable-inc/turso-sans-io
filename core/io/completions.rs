@@ -189,12 +189,19 @@ impl CompletionGroup {
     }
 
     /// Submit `c` as a child of `group` (when given): link it, run
-    /// `submit`, and unlink it again when the submit fails without having
-    /// finished it. A refused submit never completes `c`, so leaving it
-    /// linked would hold the group open for ever, and an error path that
-    /// waits on the group's unfinished children would wait on it for ever.
-    /// So the group only ever holds children that were submitted (or that
-    /// finished).
+    /// `submit`, and unlink it again when the submit returns an error.
+    /// A refused submit usually never completes `c`, so leaving it linked
+    /// would hold the group open for ever, and an error path that waits on
+    /// the group's unfinished children would wait on it for ever.
+    ///
+    /// A refused `c` may still complete later, though: io_uring can put
+    /// the entry in the ring before `ring.submit()` fails, and another
+    /// thread stepping the ring may then complete it at any time, even
+    /// during this call. Once unlinked, the group no longer tracks `c`: its
+    /// completion no longer counts into the group, and the group's error
+    /// paths no longer wait for it. Exactly one of the two sides counts `c`
+    /// out of the group: whichever takes `c`'s parent link first (the
+    /// completion in `Completion::callback`, or `unlink` here).
     pub fn submit(
         group: Option<&mut Self>,
         c: Completion,
@@ -205,22 +212,28 @@ impl CompletionGroup {
         };
         group.add(&c);
         let r = submit(c.clone());
-        if r.is_err() && !c.finished() {
+        if r.is_err() {
             group.unlink(&c);
         }
         r
     }
 
-    /// Undo `add` for a child that was never submitted.
+    /// Undo `add` for a child whose submit was refused. Taking the parent
+    /// link decides who counts `c` out: if `c` already completed (on this
+    /// thread or another), its callback took the link and counted it, and
+    /// `c` stays in the group as a finished child. Otherwise we take the
+    /// link here, so a later completion of `c` no longer reaches the group.
     fn unlink(&mut self, c: &Completion) {
         let inner = c.get_inner();
+        if inner.parent.lock().take().is_none() {
+            return;
+        }
         let idx = self
             .completions
             .iter()
             .rposition(|x| x.inner.as_ref().is_some_and(|x| Arc::ptr_eq(x, inner)))
             .expect("unlink: completion is not in the group");
         let _unlinked = self.completions.remove(idx);
-        *inner.parent.lock() = None;
         let prev = self.inner.outstanding.fetch_sub(1, Ordering::SeqCst);
         turso_assert!(prev > 1, "unlink: group counted below its builder token");
     }
@@ -1307,6 +1320,105 @@ mod tests {
         // Callback should only be called once
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
         assert!(c.succeeded());
+    }
+
+    fn refused() -> crate::LimboError {
+        crate::LimboError::InternalError("refused".into())
+    }
+
+    fn counting_group() -> (CompletionGroup, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls2 = calls.clone();
+        let group = CompletionGroup::new(move |_| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+        });
+        (group, calls)
+    }
+
+    #[test]
+    fn submit_err_while_unfinished_restores_the_count() {
+        let (mut group, calls) = counting_group();
+        let c = Completion::new_write(|_| {});
+        let r = CompletionGroup::submit(Some(&mut group), c.clone(), |_| Err(refused()));
+        assert!(r.is_err());
+        assert!(group.is_empty(), "a refused child stays out of the group");
+        let g = group.build();
+        assert!(g.finished());
+        assert!(g.succeeded());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        // A late completion of the refused child no longer reaches the group.
+        c.complete(0);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn submit_err_after_synchronous_completion_counts_once() {
+        let (mut group, calls) = counting_group();
+        let other = Completion::new_write(|_| {});
+        group.add(&other);
+        let c = Completion::new_write(|_| {});
+        let r = CompletionGroup::submit(Some(&mut group), c, |c| {
+            c.error(CompletionError::Aborted);
+            Err(refused())
+        });
+        assert!(r.is_err());
+        assert_eq!(group.len(), 2, "a finished child stays in the group");
+        let g = group.build();
+        assert!(!g.finished(), "the other child still holds the group");
+        other.complete(0);
+        assert!(g.finished());
+        assert_eq!(g.get_error(), Some(CompletionError::Aborted));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn submit_ok_keeps_the_child_counted() {
+        let (mut group, calls) = counting_group();
+        let c = Completion::new_write(|_| {});
+        let r = CompletionGroup::submit(Some(&mut group), c.clone(), Ok);
+        assert!(r.is_ok());
+        assert_eq!(group.len(), 1);
+        let g = group.build();
+        assert!(!g.finished());
+        c.complete(0);
+        assert!(g.finished());
+        assert!(g.succeeded());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn submit_err_racing_a_completion_on_another_thread_counts_once() {
+        use std::sync::atomic::AtomicBool;
+        use std::thread;
+        for i in 0..20_000 {
+            let (mut group, calls) = counting_group();
+            let c = Completion::new_write(|_| {});
+            let go = Arc::new(AtomicBool::new(false));
+            let (c2, go2) = (c.clone(), go.clone());
+            let t = thread::spawn(move || {
+                while !go2.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                c2.complete(0);
+            });
+            // The entry is "in the ring" once `go` is set; the Err return
+            // then races the other thread's completion.
+            let r = CompletionGroup::submit(Some(&mut group), c.clone(), |_| {
+                go.store(true, Ordering::Release);
+                Err(refused())
+            });
+            assert!(r.is_err());
+            let g = group.build();
+            t.join().unwrap();
+            assert!(c.finished());
+            assert!(g.finished(), "iteration {i}: group did not finish");
+            assert!(g.succeeded());
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "iteration {i}: group callback ran other than once"
+            );
+        }
     }
 
     #[test]

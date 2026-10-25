@@ -1003,7 +1003,8 @@ impl LogicalLog {
 
     /// Writes the header and returns it with its CRC filled in. The caller
     /// decides when the returned header becomes the in-memory header. The
-    /// write is added to `group`, when given, before it is submitted.
+    /// write is submitted as a child of `group`, when given, through
+    /// `CompletionGroup::submit`.
     fn write_header(
         &self,
         mut header: LogHeader,
@@ -1030,10 +1031,7 @@ impl LogicalLog {
                 );
             }
         });
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pwrite(0, buffer, c)?;
+        let c = CompletionGroup::submit(group, c, |c| self.file.pwrite(0, buffer, c))?;
         Ok((header, c))
     }
 
@@ -1109,8 +1107,9 @@ impl LogicalLog {
                 tracing::error!("logical_log_truncate failed: {}", err);
             }
         });
-        group.add(&c);
-        let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
+        let _truncate_c = CompletionGroup::submit(Some(&mut group), c, |c| {
+            self.file.truncate(LOG_HDR_SIZE as u64, c)
+        })?;
         self.offset = 0;
         Ok(group.build())
     }

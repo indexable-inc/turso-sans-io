@@ -668,7 +668,8 @@ pub fn begin_write_btree_page(
 /// and submit each run as a `writev` call,
 /// for 3 total syscalls instead of 9.
 ///
-/// Each run's write is added to `group` before it is submitted. Returns
+/// Each run's write is submitted through `CompletionGroup::submit` as a
+/// child of `group`, so a refused run is not left in the group. Returns
 /// the number of runs submitted.
 pub fn write_pages_vectored(
     pager: &Pager,
@@ -745,13 +746,13 @@ pub fn write_pages_vectored(
                 done_cl.store(true, Ordering::Release);
             }
         });
-        group.add(&cmp);
         let io_ctx = pager.io_ctx.read();
         let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
-        match pager
-            .db_file
-            .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
-        {
+        match CompletionGroup::submit(Some(&mut *group), cmp, |cmp| {
+            pager
+                .db_file
+                .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
+        }) {
             Ok(c) => completions.push(c),
             Err(e) => {
                 // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.

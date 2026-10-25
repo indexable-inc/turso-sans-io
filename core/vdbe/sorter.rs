@@ -771,8 +771,8 @@ impl SortedChunk {
     /// if there's no room in the buffer or no data left to read (no IO issued).
     ///
     /// On completion, appends data to `buffer` and updates `buffer_len` and `total_bytes_read`.
-    /// Reads more of the chunk file into the buffer. The read is added to
-    /// `group`, when given, before it is submitted.
+    /// Reads more of the chunk file into the buffer. The read is submitted
+    /// as a child of `group`, when given, through `CompletionGroup::submit`.
     fn read(&mut self, group: Option<&mut CompletionGroup>) -> Result<Option<Completion>> {
         let free_buffer_space = self.buffer.read().len() - self.buffer_len();
         let remaining_chunk_bytes =
@@ -824,13 +824,9 @@ impl SortedChunk {
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        let c = self.file.pread(
-            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
-            c,
-        )?;
+        let offset =
+            self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64;
+        let c = CompletionGroup::submit(group, c, |c| self.file.pread(offset, c))?;
         Ok(Some(c))
     }
 

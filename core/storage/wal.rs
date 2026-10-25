@@ -4473,8 +4473,9 @@ impl Wal for WalFile {
                     tracing::warn!("WAL truncate of orphaned frames failed: {err}");
                 }
             });
-            group.add(&c);
-            let _trunc_c = file.truncate(WAL_HEADER_SIZE as u64, c)?;
+            let _trunc_c = CompletionGroup::submit(Some(&mut group), c, |c| {
+                file.truncate(WAL_HEADER_SIZE as u64, c)
+            })?;
         }
         Ok(Some(group.build()))
     }
