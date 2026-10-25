@@ -13071,6 +13071,8 @@ pub fn op_insert(
         insn
     );
 
+    // No nested statement steps inside a b-tree mutation (stream claims).
+    let _mutation = pager.stream_mutation();
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
@@ -13543,6 +13545,8 @@ pub fn op_delete(
         insn
     );
 
+    // No nested statement steps inside a b-tree mutation (stream claims).
+    let _mutation = pager.stream_mutation();
     loop {
         match state.active_op_state.delete().sub_state {
             OpDeleteSubState::MaybeCaptureRecord => {
@@ -13693,6 +13697,12 @@ pub fn op_idx_delete(
         insn
     );
 
+    if matches!(state.cursors[*cursor_id], Some(Cursor::IndexMethod(_))) {
+        // Final review M2: the index-method delete writes b-tree pages too.
+        if let Some(r) = stream_reserve(state, pager, 0)? {
+            return Ok(r);
+        }
+    }
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[*cursor_id] {
         return_if_io!(
             state,
@@ -13702,6 +13712,7 @@ pub fn op_idx_delete(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    let _mutation = pager.stream_mutation();
 
     loop {
         #[cfg(debug_assertions)]
@@ -13820,6 +13831,22 @@ pub fn op_idx_insert(
         *insn
     );
 
+    // Before the index-method branch too: its insert writes b-tree pages.
+    if pager.is_stream()
+        && matches!(
+            *state.active_op_state.idx_insert(),
+            OpIdxInsertState::MaybeSeek
+        )
+    {
+        let payload = match &state.registers[record_reg] {
+            Register::Record(r) => r.as_blob().len(),
+            _ => 0,
+        };
+        if let Some(r) = stream_reserve(state, pager, payload)? {
+            return Ok(r);
+        }
+    }
+
     if let Some(Cursor::IndexMethod(cursor)) = &mut state.cursors[cursor_id] {
         let Some(start) = unpacked_start else {
             return Err(LimboError::InternalError(
@@ -13841,21 +13868,9 @@ pub fn op_idx_insert(
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-
-    if pager.is_stream()
-        && matches!(
-            *state.active_op_state.idx_insert(),
-            OpIdxInsertState::MaybeSeek
-        )
-    {
-        let payload = match &state.registers[record_reg] {
-            Register::Record(r) => r.as_blob().len(),
-            _ => 0,
-        };
-        if let Some(r) = stream_reserve(state, pager, payload)? {
-            return Ok(r);
-        }
-    }
+    // The index-method branch may run nested statements; a b-tree insert
+    // never does.
+    let _mutation = pager.stream_mutation();
 
     let record_to_insert = match &state.registers[record_reg] {
         Register::Record(ref r) => r,

@@ -1243,3 +1243,237 @@ fn begin_read_tx_twice_unpins_the_old_version() {
     r.run(|| wal.end_read_tx());
     assert!(db.test_pins().is_empty());
 }
+
+// ---- final review ----------------------------------------------------------
+
+/// Run `sql` on `conn` for at most `runs` runs. `Ok(true)`: it finished.
+fn step_for(
+    h: &mut H,
+    stmt: &mut crate::Statement,
+    runs: u64,
+) -> crate::Result<bool> {
+    for _ in 0..runs {
+        let done = h.r.run(|| -> crate::Result<bool> {
+            loop {
+                match stmt.step()? {
+                    StepResult::Row => {}
+                    StepResult::Done => return Ok(true),
+                    StepResult::IO | StepResult::Yield => return Ok(false),
+                    o => panic!("unexpected step result {o:?}"),
+                }
+            }
+        })?;
+        if done {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Final review C1: a ROLLBACK TO that fails part way (a grown page is
+/// locked by a read in flight, so the cache can't drop it) dooms the
+/// transaction: a COMMIT after it persists none of the rolled-back pages.
+#[test]
+fn failed_rollback_dooms_the_txn() {
+    let mut h = H::open(Cfg::default());
+    h.fill("t", 10);
+    let size = h.one("PRAGMA page_count");
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok(
+        "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1000 UNION ALL SELECT i + 1 FROM c WHERE i < 1080) \
+         SELECT i, 1, zeroblob(900) FROM c",
+    );
+    let grown = h.one("PRAGMA page_count");
+    assert!(grown > size + 10, "grew: {size} -> {grown}");
+    let pager = h.conn.pager.load().clone();
+    assert!(pager.stream_test_lock(grown as usize, true), "last page resident");
+    let before = h.stats();
+    let err = h.exec("ROLLBACK TO a").expect_err("the cache can't drop it");
+    pager.stream_test_lock(grown as usize, false);
+    assert!(h.stats().doomed > before.doomed, "{err}: {:?}", h.stats());
+    let _ = h.exec("COMMIT");
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("PRAGMA page_count"), size);
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
+    h.integrity();
+}
+
+/// Final review C2: a stream has one page size. Any other one is refused
+/// on an empty database, and the database is created at 4096.
+#[test]
+fn stream_refuses_other_page_sizes() {
+    let mut h = H::open(Cfg::default());
+    for size in [8192, 1024, 65536, 1000] {
+        let err = h
+            .exec(&format!("PRAGMA page_size = {size}"))
+            .expect_err("only 4096");
+        assert!(err.to_string().contains("page size"), "{size}: {err}");
+    }
+    h.ok("PRAGMA page_size = 4096");
+    h.fill("t", 4);
+    assert_eq!(h.one("PRAGMA page_size"), 4096);
+    h.integrity();
+}
+
+/// Final review C3: a run whose free credits stage no spill (here the
+/// grant itself is 1) parks the writer instead of failing it SQLITE_FULL;
+/// a later run with the full grant finishes it.
+#[test]
+fn short_credit_spill_parks_not_full() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    let mut stmt = h.r.run(|| conn.prepare("UPDATE t SET n = 1")).unwrap();
+    let waits = h.stats().credit_waits;
+    h.r.credits = 1;
+    let done = step_for(&mut h, &mut stmt, 200).expect("parks, not FULL");
+    assert!(!done, "can't finish on one credit a run");
+    assert!(h.stats().credit_waits > waits, "{:?}", h.stats());
+    h.r.credits = super::DEFAULT_CREDITS;
+    assert!(step_for(&mut h, &mut stmt, MAX_RUNS).unwrap());
+    drop(stmt);
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    h.integrity();
+}
+
+/// Final review M1 (and reset ending a claim): a trigger waiting on IO
+/// inside its parent's step holds a claim under its own owner; resetting
+/// the parent ends it, so the connection's next writer is not starved.
+#[test]
+fn parent_reset_ends_its_triggers_claim() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 4);
+    h.fill("big", 100);
+    h.ok("CREATE TABLE log(x INTEGER, v BLOB)");
+    h.ok("CREATE TRIGGER tr AFTER UPDATE ON t BEGIN INSERT INTO log SELECT id, v FROM big; END");
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    let mut stmt = h
+        .r
+        .run(|| conn.prepare("UPDATE t SET n = 1 WHERE id = 1"))
+        .unwrap();
+    let pager = conn.pager.load().clone();
+    let mut nested = false;
+    for _ in 0..MAX_RUNS {
+        assert!(!step_for(&mut h, &mut stmt, 1).unwrap(), "finished first");
+        if pager.stream_test_parents() > 0 && !h.sdb.test_claims().is_empty() {
+            nested = true;
+            break;
+        }
+    }
+    assert!(nested, "the trigger never stopped mid-IO with a claim");
+    // Let its IO land first (a reset waits for IO in flight), without
+    // stepping it: the trigger's claim is still there.
+    for _ in 0..4 {
+        h.r.run(|| {});
+    }
+    assert!(!h.sdb.test_claims().is_empty());
+    h.r.run(|| stmt.reset()).unwrap();
+    assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
+    assert_eq!(pager.stream_test_parents(), 0);
+    drop(stmt);
+    h.ok("UPDATE big SET n = 2");
+    h.ok("ROLLBACK");
+    h.integrity();
+}
+
+/// An error part way through a step ends that statement's claim.
+#[test]
+fn error_mid_step_clears_the_claim() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.ok("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER CHECK (n < 300), v BLOB)");
+    h.ok(
+        "INSERT INTO u WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400) \
+         SELECT i, 0, zeroblob(900) FROM c",
+    );
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    let err = h.exec("UPDATE u SET n = id").expect_err("CHECK fails at 300");
+    assert!(!is_full(&err), "{err}");
+    assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
+    h.ok("UPDATE u SET n = 1 WHERE id <= 200");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM u"), 200);
+    h.integrity();
+}
+
+/// `hold_can_fit`: a claim whose hold, plus a read and a pin, fits no
+/// run's credits is refused.
+#[test]
+fn hold_can_fit_is_bounded_by_the_grant() {
+    let (db, _arena) = bare(16, u64::MAX / 2);
+    let mut r = MemRunner::new(db.clone(), MemStore::new());
+    assert!(db.hold_can_fit(1 << 20), "no run seen yet");
+    r.credits = super::MIN_CREDITS;
+    r.run(|| {});
+    // BEGIN + one part's closing op + 2 = 4.
+    assert!(db.hold_can_fit(1));
+    assert!(db.hold_can_fit(1024));
+    assert!(!db.hold_can_fit(1025));
+    r.credits = 8;
+    r.run(|| {});
+    assert!(db.hold_can_fit(4 * 1024));
+    assert!(!db.hold_can_fit(5 * 1024 + 1));
+}
+
+/// A reserve makes room before it claims: with the fewest credits and a
+/// small arena, a savepoint's records and the spills that make room for
+/// them share every run, and nothing fails SQLITE_FULL.
+#[test]
+fn reserve_makes_room_before_claiming() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        credits: super::MIN_CREDITS,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    h.ok("COMMIT");
+    let s = h.stats();
+    assert!(s.spilled_pages > 0 && s.records > 0, "{s:?}");
+    assert_eq!(s.reserve_full, 0, "{s:?}");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    h.integrity();
+}
+
+/// Round-2 M5: a dirty page whose read failed dooms the transaction (its
+/// bytes are lost); the rollback leaves the committed state alone.
+#[test]
+fn failed_read_of_a_dirty_page_dooms_the_txn() {
+    let mut h = H::open(Cfg::default());
+    h.fill("t", 10);
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 3 WHERE id = 1");
+    let pager = h.conn.pager.load().clone();
+    let before = h.stats();
+    let err = h.r.run(|| pager.stream_test_fail_dirty_read()).expect_err("dooms");
+    assert!(err.to_string().contains("dirty page"), "{err}");
+    assert!(h.stats().doomed > before.doomed);
+    assert!(h.exec("SELECT sum(n) FROM t").is_err(), "doomed");
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+}

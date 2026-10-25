@@ -61,10 +61,33 @@ struct StreamPagerState {
     /// a spill there leaves their quota (they are not claimed yet, so
     /// their credits stay free for the spill).
     pending_records: u64,
+    /// (child, parent) for every nested statement that stepped inside its
+    /// parent's step and stopped mid-opcode (a trigger waiting on IO, a
+    /// nested ParseSchema): its claim ends when it finishes, or when the
+    /// parent's statement ends (reset or drop mid-IO).
+    parents: Vec<(u64, u64)>,
+    /// A b-tree mutation opcode (Insert, Delete, IdxInsert, IdxDelete) is
+    /// running: no nested statement may step inside it (see
+    /// [`Pager::stream_swap_owner`]).
+    in_mutation: bool,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
     doomed: Option<Doom>,
+}
+
+/// See [`Pager::stream_mutation`].
+pub struct StreamMutation {
+    pager: Arc<Pager>,
+    was: bool,
+}
+
+impl Drop for StreamMutation {
+    fn drop(&mut self) {
+        if let Some(sp) = &self.pager.stream {
+            sp.st.lock().in_mutation = self.was;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,8 +219,17 @@ impl Pager {
         let Some(sp) = &self.stream else {
             return 0;
         };
-        let prev = std::mem::replace(&mut sp.st.lock().owner, owner);
+        let mut st = sp.st.lock();
+        let prev = std::mem::replace(&mut st.owner, owner);
         if prev != 0 && prev != owner {
+            debug_assert!(
+                !st.in_mutation,
+                "stream: a nested statement stepped inside a b-tree mutation opcode"
+            );
+            if !st.parents.iter().any(|&(c, _)| c == owner) {
+                st.parents.push((owner, prev));
+            }
+            drop(st);
             sp.db.clear_claim((sp.conn, prev));
         }
         prev
@@ -212,6 +244,7 @@ impl Pager {
         if let Some(sp) = &self.stream {
             if !mid_op {
                 sp.db.clear_claim((sp.conn, owner));
+                sp.st.lock().parents.retain(|&(c, _)| c != owner);
                 if prev == 0 {
                     // Reserves made between top-level steps (a halt run by
                     // reset, schema-version writes) are under owner 0.
@@ -269,6 +302,27 @@ impl Pager {
     /// The page size and reserved bytes of a stream database. Both are set
     /// when the pager is created (or at page-1 init); unset is a fork bug,
     /// not a reason to guess.
+    /// Final review C2: a stream's slots are its page size. Any other size
+    /// (or reserved bytes a codec needs that leave too little usable space)
+    /// would write a page 1 bigger than its slot.
+    pub(crate) fn stream_check_page_size(&self, size: PageSize) -> Result<()> {
+        if size.get() as usize != stream::PAGE_SIZE {
+            return Err(LimboError::InvalidArgument(format!(
+                "stream: page size {} is not supported, the store's is {}",
+                size.get(),
+                stream::PAGE_SIZE
+            )));
+        }
+        let reserved = self.io_ctx.read().get_reserved_space_bytes();
+        if !size.has_valid_reserved_space(reserved) {
+            return Err(LimboError::InvalidArgument(format!(
+                "stream: reserved space {reserved} leaves less than {} usable bytes",
+                PageSize::MIN_USABLE_SPACE
+            )));
+        }
+        Ok(())
+    }
+
     pub(crate) fn stream_usable_space(&self) -> Result<usize> {
         // A stream database has one page size.
         let page_size = self
@@ -361,7 +415,31 @@ impl Pager {
         if let Some(sp) = &self.stream {
             sp.db.clear_claim((sp.conn, owner));
             sp.db.clear_claim((sp.conn, 0));
+            // Nested statements still mid-IO under this one (a trigger, a
+            // nested ParseSchema) end with it.
+            let mut ended = vec![owner];
+            let mut st = sp.st.lock();
+            while let Some(i) = st.parents.iter().position(|(_, p)| ended.contains(p)) {
+                let (child, _) = st.parents.swap_remove(i);
+                ended.push(child);
+            }
+            st.parents.retain(|&(c, _)| c != owner);
+            drop(st);
+            for &child in &ended[1..] {
+                sp.db.clear_claim((sp.conn, child));
+            }
         }
+    }
+
+    /// A b-tree mutation opcode starts; the guard ends it. Nested steps
+    /// inside one are a fork bug (see [`Self::stream_swap_owner`]).
+    pub fn stream_mutation(self: &Arc<Self>) -> Option<StreamMutation> {
+        let sp = self.stream.as_ref()?;
+        let was = std::mem::replace(&mut sp.st.lock().in_mutation, true);
+        Some(StreamMutation {
+            pager: self.clone(),
+            was,
+        })
     }
 
     /// Make sure `slots` fresh slots are free, `records` subjournal records
@@ -480,6 +558,16 @@ impl Pager {
         if lent > 0 || spilled > 0 || others > 0 {
             io_yield_one!(db.park());
         }
+        // Final review C3: dirty pages could spill, and would in a run with
+        // more free credits (the grant less in-flight reads and the holds
+        // was 0 this run, not for ever): wait for that run.
+        if self.stream_spill_quota() > 0
+            && db.spill_credit_short()
+            && !self.page_cache.read().spillable_pages(1).is_empty()
+        {
+            db.bump_credit_wait();
+            io_yield_one!(db.park());
+        }
         db.bump(|s| s.reserve_full += 1);
         Err(stream::full().into())
     }
@@ -517,12 +605,18 @@ impl Pager {
     /// doom the transaction for. No subjournal record is written at spill:
     /// records are taken at `add_dirty`, before the page changes, and a
     /// staged part is only ever overwritten by a later one, never rewound.
-    fn stream_spill(&self) -> Result<u32> {
+    /// Quota a spill may take: what is left past every claim's records and
+    /// those of the reserve in progress.
+    fn stream_spill_quota(&self) -> u64 {
         let db = &self.sp().db;
         let pending = self.sp().st.lock().pending_records;
-        let quota = db
-            .quota_left()
-            .saturating_sub(db.claimed_records() + pending);
+        db.quota_left()
+            .saturating_sub(db.claimed_records() + pending)
+    }
+
+    fn stream_spill(&self) -> Result<u32> {
+        let db = &self.sp().db;
+        let quota = self.stream_spill_quota();
         let room = db
             .writes_within(db.free_credits())
             .min(MAX_PART_PAGES as u64)
@@ -724,6 +818,16 @@ impl Pager {
         savepoint: &SavepointSnapshot,
         end: u64,
     ) -> Result<()> {
+        // Final review C1: a rollback that fails part way (the cache can't
+        // drop a grown page that is locked by a read in flight, or pinned)
+        // has trimmed the dirty set and taken the pending restore, but has
+        // staged no rewind and queued no restore. Committing after that
+        // would persist the rolled-back pages, so the transaction is gone.
+        self.stream_rollback_inner(savepoint, end)
+            .map_err(|e| self.stream_doom(e))
+    }
+
+    fn stream_rollback_inner(&self, savepoint: &SavepointSnapshot, end: u64) -> Result<()> {
         self.reset_internal_states();
         let db = self.sp().db.clone();
         // The claim of the statement rolling back ends with its step (or
@@ -1016,6 +1120,49 @@ impl Pager {
             FreePageState::AddToTrunk { .. } => "AddToTrunk",
             FreePageState::NewTrunk { .. } => "NewTrunk",
         }
+    }
+
+    /// Test hook: lock (`on`) or unlock resident page `id`, as a read in
+    /// flight does. False if it is not resident.
+    #[cfg(test)]
+    pub(crate) fn stream_test_lock(&self, id: usize, on: bool) -> bool {
+        let Some(page) = self.page_cache.write().peek(&PageCacheKey::new(id), false) else {
+            return false;
+        };
+        if on {
+            page.set_locked();
+        } else {
+            page.clear_locked();
+        }
+        true
+    }
+
+    /// Test hook: nested statements still registered under a parent.
+    #[cfg(test)]
+    pub(crate) fn stream_test_parents(&self) -> usize {
+        self.sp().st.lock().parents.len()
+    }
+
+    /// Test hook: a dirty page's read failed (it is unloaded, as a failed
+    /// restore read leaves it): what `stream_take_failed_read` does. The
+    /// page is loaded again afterwards so the rollback finds it intact.
+    #[cfg(test)]
+    pub(crate) fn stream_test_fail_dirty_read(&self) -> Result<()> {
+        let id = self
+            .dirty_pages
+            .read()
+            .iter()
+            .find(|&id| id != DatabaseHeader::PAGE_ID as u32)
+            .expect("a dirty page") as usize;
+        let page = self
+            .page_cache
+            .write()
+            .peek(&PageCacheKey::new(id), false)
+            .expect("the dirty page is resident");
+        page.clear_loaded();
+        let res = self.stream_take_failed_read(&page);
+        page.set_loaded();
+        res
     }
 
     /// Test hook: is page `id` resident and loaded?

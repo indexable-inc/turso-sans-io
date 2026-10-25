@@ -3160,6 +3160,9 @@ impl Pager {
         if self.db_initialized() {
             return Ok(());
         }
+        if self.is_stream() {
+            self.stream_check_page_size(size)?;
+        }
         if let Some(codec) = self.page_codec_external() {
             let reserved_space = codec.required_reserved_bytes();
             if !size.has_valid_reserved_space(reserved_space) {

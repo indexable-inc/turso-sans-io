@@ -664,6 +664,19 @@ impl StreamDb {
         Self::hold_for(&g, records).saturating_add(2) <= g.max_credits
     }
 
+    /// This run's free credits stage no spill, but a run granted the most
+    /// credits seen would (past today's holds): a short-term shortage.
+    pub(crate) fn spill_credit_short(&self) -> bool {
+        if self.writes_within(self.free_credits()) > 0 {
+            return false;
+        }
+        let best = {
+            let g = self.inner.lock();
+            g.max_credits.saturating_sub(Self::held(&g))
+        };
+        self.writes_within(best) > 0
+    }
+
     pub(crate) fn bump_credit_wait(&self) {
         self.inner.lock().stats.credit_waits += 1;
     }

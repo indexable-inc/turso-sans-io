@@ -2741,11 +2741,16 @@ impl Connection {
         if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
+        let pager = self.get_pager_from_database_index(&database_id)?;
         let Some(size) = PageSize::new(size) else {
+            if pager.is_stream() {
+                return Err(LimboError::InvalidArgument(format!(
+                    "stream: page size {size} is not supported"
+                )));
+            }
             return Ok(());
         };
 
-        let pager = self.get_pager_from_database_index(&database_id)?;
         pager.set_initial_page_size(size)?;
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
