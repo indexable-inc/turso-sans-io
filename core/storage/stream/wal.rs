@@ -93,9 +93,14 @@ pub(crate) fn page_read_completion(page: PageRef, page_idx: usize, buf: Arc<Buff
 impl Wal for StreamWal {
     fn begin_read_tx(&self) -> Result<bool> {
         let head = self.db.head();
-        self.read_version.store(head, Ordering::Release);
+        let old = self.read_version.swap(head, Ordering::AcqRel);
         if !self.reading.swap(true, Ordering::AcqRel) {
             self.db.hold(head);
+        } else if old != head {
+            // Already reading at `old`: move the hold, or `old` stays held
+            // (and pinned) forever while `end_read_tx` releases `head`.
+            self.db.hold(head);
+            self.db.release(old);
         }
         let changed = self.seen.swap(head, Ordering::AcqRel) != head;
         Ok(changed)
@@ -178,16 +183,25 @@ impl Wal for StreamWal {
         let buf = Arc::new(buf);
         page.set_locked();
         let c = page_read_completion(page.clone(), frame_id as usize, buf.clone());
-        if let Some(group) = group {
-            group.add(&c);
-        }
-        match self.db.read(self.read_at(), frame_id - 1, &buf, c)? {
-            Some(c) => Ok(c),
-            None => {
+        // The op only goes out at the end of the run, so adding it to the
+        // group after it is queued is still before it is submitted; a read
+        // that was never queued must not sit in the group.
+        match self.db.read(self.read_at(), frame_id - 1, &buf, c) {
+            Ok(Some(c)) => {
+                if let Some(group) = group {
+                    group.add(&c);
+                }
+                Ok(c)
+            }
+            Ok(None) => {
                 page.clear_locked();
                 Err(LimboError::InternalError(
                     "stream: page read with no op credit".into(),
                 ))
+            }
+            Err(e) => {
+                page.clear_locked();
+                Err(e)
             }
         }
     }

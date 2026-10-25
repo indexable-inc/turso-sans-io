@@ -9,10 +9,17 @@
 //! [`MemStore::read_delay`] > 0, reads complete that many runs later still,
 //! which is how tests make a yield land between a reserve and the
 //! `add_dirty` it covers.
+//!
+//! Quota is an escrow like the host's: a staged part debits the pages the
+//! transaction had not written before, a batch debits every write, and
+//! commit (pages a later part discarded) or abort refunds. An overdraft is
+//! a guest bug and panics. The runner passes what is left as each run's
+//! `quota_pages`, and checks that a run never issues more credited ops
+//! (READ, PIN, BEGIN, STAGE, COMMIT, BATCH) than its credits.
 
 use super::{op, StreamDb, StreamOp, FLAG_AT_VERSION, FLAG_NOTIFY, PAGE_SIZE};
 use crate::sync::Arc;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ptr::NonNull;
 
 #[repr(C, align(4096))]
@@ -57,13 +64,20 @@ struct MemTxn {
     /// zeros inside them).
     discards: Vec<(u64, u64)>,
     current: Vec<Edit>,
+    /// Pages debited from the escrow.
+    debited: BTreeSet<u64>,
 }
 
 impl MemTxn {
-    fn stage(&mut self) {
+    /// Stage the current part; returns the pages it newly debits.
+    fn stage(&mut self) -> u64 {
+        let mut debit = 0;
         for e in self.current.drain(..) {
             match e {
                 Edit::Write(p, b) => {
+                    if self.debited.insert(p) {
+                        debit += 1;
+                    }
                     self.staged.insert(p, Some(b));
                 }
                 Edit::Discard(s, e) => {
@@ -74,6 +88,7 @@ impl MemTxn {
                 }
             }
         }
+        debit
     }
 }
 
@@ -99,6 +114,13 @@ pub struct MemStore {
     pub read_delay: u64,
     pub ops_applied: u64,
     pub max_txn_pages: usize,
+    /// Escrow pages left (`None`: no quota).
+    pub allowance: Option<u64>,
+    /// Versions below this are trimmed: a PIN or read at one completes
+    /// LOST.
+    pub trimmed_below: u64,
+    /// Reads of scratch pages fail (a restore that cannot finish).
+    pub fail_scratch_reads: bool,
 }
 
 impl MemStore {
@@ -108,6 +130,24 @@ impl MemStore {
 
     pub fn head(&self) -> u64 {
         self.head
+    }
+
+    /// What the next run's batch header says the instance may write.
+    pub fn quota_pages(&self) -> u64 {
+        self.allowance.unwrap_or(u64::MAX)
+    }
+
+    fn debit(&mut self, n: u64) {
+        if let Some(a) = self.allowance.as_mut() {
+            assert!(*a >= n, "escrow overdraft: {n} pages, {a} left");
+            *a -= n;
+        }
+    }
+
+    fn refund(&mut self, n: u64) {
+        if let Some(a) = self.allowance.as_mut() {
+            *a += n;
+        }
     }
 
     fn at_version(&self, page: u64, v: u64) -> Option<PageBytes> {
@@ -175,6 +215,14 @@ impl MemStore {
             op::READ => {
                 let n = o.count.max(1) as u64;
                 assert_eq!(n, 1, "the guest reads one page per op");
+                if self.fail_scratch_reads && o.page >= super::SCRATCH_BASE {
+                    self.complete_later(o.tag, super::err::IO, 0, None);
+                    return;
+                }
+                if o.flags & FLAG_AT_VERSION != 0 && o.at < self.trimmed_below {
+                    self.complete_later(o.tag, super::err::LOST, 0, None);
+                    return;
+                }
                 let data = if o.flags & FLAG_AT_VERSION != 0 {
                     assert!(o.at <= self.head, "read of a future version");
                     self.at_version(o.page, o.at)
@@ -186,7 +234,14 @@ impl MemStore {
                 let data: PageBytes = Arc::from(&data[..(o.len as usize).min(data.len())]);
                 self.complete_later(o.tag, o.len as i64, self.read_delay, Some((o.ptr, data)));
             }
-            op::PIN => *self.pins.entry(o.at).or_default() += 1,
+            op::PIN => {
+                if o.at < self.trimmed_below {
+                    self.complete_later(o.tag, super::err::LOST, 0, None);
+                } else {
+                    *self.pins.entry(o.at).or_default() += 1;
+                    self.complete_later(o.tag, 0, 0, None);
+                }
+            }
             op::UNPIN => {
                 if let Some(n) = self.pins.get_mut(&o.at) {
                     *n -= 1;
@@ -204,6 +259,7 @@ impl MemStore {
                         staged: BTreeMap::new(),
                         discards: Vec::new(),
                         current: Vec::new(),
+                        debited: BTreeSet::new(),
                     },
                 );
             }
@@ -224,7 +280,8 @@ impl MemStore {
             }
             op::STAGE => {
                 let t = self.txns.get_mut(&o.txn).expect("stage of an open txn");
-                t.stage();
+                let debit = t.stage();
+                self.debit(debit);
                 self.max_txn_pages = self.max_txn_pages.max(self.txns[&o.txn].staged.len());
                 if o.flags & FLAG_NOTIFY != 0 {
                     self.complete_later(o.tag, 0, 0, None);
@@ -232,7 +289,8 @@ impl MemStore {
             }
             op::COMMIT => {
                 let mut t = self.txns.remove(&o.txn).expect("commit of an open txn");
-                t.stage();
+                let debit = t.stage();
+                self.debit(debit);
                 let mut staged = std::mem::take(&mut t.staged);
                 // Scratch never reaches a version: the guest discards it in
                 // the last part; check that it did.
@@ -243,6 +301,13 @@ impl MemStore {
                     "a committed version holds scratch pages"
                 );
                 staged.retain(|p, b| *p < super::SCRATCH_BASE || b.is_some());
+                // Debited pages the version does not keep come back.
+                let kept = t
+                    .debited
+                    .iter()
+                    .filter(|p| staged.get(p).is_some_and(|b| b.is_some()))
+                    .count() as u64;
+                self.refund(t.debited.len() as u64 - kept);
                 // Committed pages inside a discarded range read as zeros.
                 for &(s, e) in &t.discards {
                     let hit: Vec<u64> = self
@@ -261,10 +326,13 @@ impl MemStore {
             }
             op::BATCH => {
                 let writes = std::mem::take(&mut self.batch);
+                self.debit(writes.len() as u64);
                 self.commit(o.at, writes.into_iter().map(|(p, b)| (p, Some(b))));
             }
             op::ABORT => {
-                self.txns.remove(&o.txn);
+                if let Some(t) = self.txns.remove(&o.txn) {
+                    self.refund(t.debited.len() as u64);
+                }
             }
             op::NOTIFY => self.complete_later(o.tag, 0, 0, None),
             k => panic!("unknown stream op kind {k}"),
@@ -329,7 +397,7 @@ impl MemRunner {
     /// store, give lent slots back.
     pub fn run<T>(&mut self, f: impl FnOnce() -> T) -> T {
         self.runs += 1;
-        self.db.begin_run(self.credits);
+        self.db.begin_run(self.credits, self.store.quota_pages());
         (self.scope)(false);
         let due = self.store.take_due();
         (self.scope)(true);
@@ -339,6 +407,22 @@ impl MemRunner {
         let out = f();
         self.db.take_ops(&mut self.ops);
         (self.scope)(false);
+        let credited = self
+            .ops
+            .iter()
+            .filter(|o| {
+                matches!(
+                    o.kind,
+                    op::READ | op::PIN | op::BEGIN | op::STAGE | op::COMMIT | op::BATCH
+                )
+            })
+            .count();
+        assert!(
+            credited <= self.credits as usize,
+            "run {} issued {credited} credited ops with {} credits",
+            self.runs,
+            self.credits
+        );
         for o in self.ops.drain(..) {
             self.store.apply(o);
         }

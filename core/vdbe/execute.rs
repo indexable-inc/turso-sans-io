@@ -5805,6 +5805,13 @@ pub fn op_savepoint(
             if !matches!(state.commit_state, CommitState::Ready) {
                 return op_auto_commit(program, state, &release_commit_insn(), pager);
             }
+            // Stream storage: a savepoint rollback still restoring must
+            // finish before the savepoint stack changes again.
+            if mv_store.is_none() {
+                if let IOResult::IO(io) = pager.stream_gate()? {
+                    return Ok(state.suspend_on_io(io));
+                }
+            }
             let release_result = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.release_named_savepoint(tx_id, name)?,
@@ -5840,6 +5847,13 @@ pub fn op_savepoint(
             Ok(InsnFunctionStepResult::Step)
         }
         SavepointOp::RollbackTo => {
+            // Stream storage: finish the previous rollback's restore first,
+            // so this one starts from settled pages.
+            if mv_store.is_none() {
+                if let IOResult::IO(io) = pager.stream_gate()? {
+                    return Ok(state.suspend_on_io(io));
+                }
+            }
             let deferred_fk_snapshot = if let Some(mv_store) = mv_store.as_ref() {
                 match conn.get_mv_tx_id() {
                     Some(tx_id) => mv_store.rollback_to_named_savepoint(tx_id, name)?,
@@ -13034,7 +13048,7 @@ fn stream_reserve(
     if !pager.is_stream() {
         return Ok(None);
     }
-    match pager.stream_reserve_op(pager.stream_op_slots(payload))? {
+    match pager.stream_reserve_op(pager.stream_op_slots(payload)?)? {
         IOResult::Done(()) => Ok(None),
         IOResult::IO(io) => Ok(Some(state.suspend_on_io(io))),
     }

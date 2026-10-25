@@ -1772,6 +1772,9 @@ impl ProgramState {
             );
             self.is_active_write = false;
         }
+        // Stream storage: the statement's slot reservation and held credits
+        // end with it.
+        pager.stream_end_statement();
         // A write statement that keeps its changes must have applied them to
         // the materialized views first (see
         // `Program::maintain_views_for_kept_changes`). Everything left in the
@@ -3663,6 +3666,14 @@ impl Program {
                 }
             }
             match err {
+                // Stream storage gave the transaction up (a rollback that
+                // could not finish, or a staged part the quota refused): it
+                // is already aborted on the store, so roll it back whole
+                // (streams-guest-api §14).
+                _ if pager.stream_doomed() => {
+                    self.rollback_current_txn(pager);
+                    self.connection.set_changes(0);
+                }
                 // Transaction errors, e.g. trying to start a nested transaction, do not cause a rollback.
                 Some(LimboError::TxError(_)) => {}
                 // Table locked errors, e.g. trying to checkpoint in an interactive transaction, do not cause a rollback.

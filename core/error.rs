@@ -218,7 +218,10 @@ impl LimboError {
             | Self::ConstraintViolation(_)
             | Self::ForeignKeyConstraint(_)
             | Self::Raise(..) => 19,
-            Self::Busy | Self::BusySnapshot | Self::StatementsInProgress(_) => 5,
+            Self::Busy
+            | Self::BusySnapshot
+            | Self::StatementsInProgress(_)
+            | Self::CompletionError(CompletionError::SnapshotLost) => 5,
             Self::TableLocked => 6,
             Self::ReadOnly => 8,
             Self::Interrupt => 9,
@@ -337,6 +340,10 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+    /// A store stream read at a snapshot whose version was released first
+    /// (`TRIMMED`): the statement fails SQLITE_BUSY, the database is fine.
+    #[error("database snapshot is gone (version released)")]
+    SnapshotLost,
 }
 
 /// Convert a `std::io::Error` into a `LimboError` with an operation label.

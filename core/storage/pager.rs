@@ -2182,6 +2182,12 @@ impl Pager {
                             *self.header_ref_state.write() = HeaderRefState::Start;
                             return Err(err.into());
                         }
+                        // Re-entered before the read landed (stream storage
+                        // completes reads in a later run, and a caller may
+                        // step again on an unrelated wakeup): wait again.
+                        if !c.finished() {
+                            io_yield_one!(c.clone());
+                        }
                     }
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     turso_assert!(
@@ -3093,6 +3099,13 @@ impl Pager {
     /// The usable size of a page might be an odd number. However, the usable size is not allowed to be less than 480.
     /// In other words, if the page size is 512, then the reserved space size cannot exceed 32.
     pub fn usable_space(&self) -> usize {
+        if self.is_stream() {
+            // No header IO and no guessed default in stream mode: page size
+            // and reserved bytes are known from open (or page-1 init).
+            return self
+                .stream_usable_space()
+                .unwrap_or_else(|e| panic!("stream usable_space: {e}"));
+        }
         let page_size = self.get_page_size().unwrap_or_else(|| {
             let size = self
                 .io
@@ -3712,7 +3725,20 @@ impl Pager {
             {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx as usize);
-                if let Some(page) = page_cache.get(&page_key)? {
+                let mut hit = page_cache.get(&page_key)?;
+                if self.is_stream()
+                    && hit
+                        .as_ref()
+                        .is_some_and(|p| !p.is_loaded() && !p.is_locked())
+                {
+                    // Its stream read failed (the error went to the reader
+                    // that issued it): read again rather than wait forever.
+                    drop(page_cache);
+                    let failed = hit.take().expect("checked above");
+                    self.stream_drop_failed_read(&failed);
+                    page_cache = self.page_cache.write();
+                }
+                if let Some(page) = hit {
                     turso_assert!(
                         page_idx as usize == page.get().id(),
                         "attempted to read page but got different page",
@@ -3813,13 +3839,10 @@ impl Pager {
     /// pages are in use); later inserts drain the excess.
     fn cache_insert(&self, page_idx: usize, page: PageRef) -> IOResultOr<()> {
         if self.stream.is_some() {
-            // The slot was made free before the read; the cache never
-            // decides capacity in stream mode, the arena does.
-            let mut page_cache = self.page_cache.write();
-            return match page_cache.force_insert_page(PageCacheKey::new(page_idx), page) {
-                Ok(_) | Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
-                Err(e) => Err(LimboError::from(e).into()),
-            };
+            return self
+                .stream_cache_insert(page_idx, page)
+                .map(IOResult::Done)
+                .map_err(Into::into);
         }
         {
             let mut page_cache = self.page_cache.write();
@@ -5585,11 +5608,10 @@ impl Pager {
         result
     }
 
-    pub fn freepage_list(&self) -> u32 {
+    pub fn freepage_list(&self) -> Result<u32> {
         self.io
             .block(|| HeaderRef::from_pager(self))
             .map(|header_ref| header_ref.borrow().freelist_pages.get())
-            .unwrap_or(0)
     }
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
@@ -5754,6 +5776,12 @@ impl Pager {
             AllocatePage1State::Start => {
                 turso_assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
+                if self.stream.is_some() {
+                    // The page-1 batch's credit, quota and slot, before
+                    // anything is built (it must not fail halfway).
+                    return_if_io!(self.stream_page1_ready());
+                    return_if_io!(self.stream_ensure_slots(1));
+                }
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should not be initialized and should not do any IO");

@@ -107,6 +107,8 @@ struct Cfg {
     quota: u64,
     read_delay: u64,
     count_heap: bool,
+    /// Op credits per run.
+    credits: u32,
 }
 
 impl Default for Cfg {
@@ -117,6 +119,7 @@ impl Default for Cfg {
             quota: u64::MAX / 2,
             read_delay: 1,
             count_heap: false,
+            credits: super::DEFAULT_CREDITS,
         }
     }
 }
@@ -162,7 +165,9 @@ impl H {
         let io: Arc<dyn IO> = StreamIo::new(sdb.clone(), 7);
         let mut store = MemStore::new();
         store.read_delay = cfg.read_delay;
+        store.allowance = (cfg.quota < u64::MAX / 2).then_some(cfg.quota);
         let mut r = MemRunner::new(sdb.clone(), store);
+        r.credits = cfg.credits;
         if cfg.count_heap {
             r.scope = guest_scope;
         }
@@ -202,6 +207,10 @@ impl H {
         let s = self.stats();
         assert_eq!(s.blocking_calls, 0, "something blocked: {s:?}");
         assert_eq!(s.hard_rule_full, 0, "add_dirty hit the hard rule: {s:?}");
+        assert_eq!(
+            s.credit_short, 0,
+            "an op found no credit it was promised: {s:?}"
+        );
     }
 
     /// Run `sql` on `conn` to completion, one step loop per run (a run ends
@@ -546,6 +555,7 @@ fn free_page_first_trunk_uncached_one_slot_parks() {
     h.exec_on(&c2, "UPDATE t SET n = 1 WHERE id = 80", &[])
         .unwrap();
     let pager = c2.pager.load().clone();
+    let pager1 = h.conn.pager.load().clone();
     let free_id = int(&h.exec_on(&c2, "PRAGMA page_count", &[]).unwrap()[0][0]) as usize;
     let trunk_id = {
         // Page 1 is cached and loaded on c2 now; read the trunk pointer.
@@ -578,7 +588,10 @@ fn free_page_first_trunk_uncached_one_slot_parks() {
                 && pager.stream_test_free_page_state() == "AddToTrunk"
                 && pager.stream_test_loaded(trunk_id)
             {
-                // The trunk read finished: give the slots away now.
+                // The trunk read finished: give the slots away now. The
+                // arena is shared, so empty the other connection's cache
+                // too (a reserve evicts from it).
+                pager1.stream_test_squeeze(None);
                 pager.stream_test_squeeze(Some(trunk_id));
                 squeezed = true;
             }
@@ -657,4 +670,193 @@ fn update_50k_pages_fails_constraint_in_1024_slot_arena() {
     );
     assert!(peak < bound as isize, "heap peak {peak} over {bound}");
     h.check_invariants();
+}
+
+/// Review C1: `ROLLBACK TO b` then `ROLLBACK TO a` over the same page puts
+/// back the image from when `a` was taken, not the one from `b`. Both the
+/// SQL path (the second rollback waits for the first restore) and two
+/// rollbacks in one run with no gate in between (the pending restore is
+/// merged into the new one).
+#[test]
+fn nested_rollback_to_same_page_restores_outer_image() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 40);
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = 1 WHERE id = 5");
+    h.ok("SAVEPOINT b");
+    h.ok("UPDATE t SET n = 2 WHERE id = 5");
+    h.ok("ROLLBACK TO b");
+    h.ok("ROLLBACK TO a");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT n FROM t WHERE id = 5"), 0);
+
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = 1 WHERE id = 5");
+    h.ok("SAVEPOINT b");
+    h.ok("UPDATE t SET n = 2 WHERE id = 5");
+    let pager = h.conn.pager.load().clone();
+    h.r.run(|| {
+        pager
+            .rollback_to_named_savepoint("b")
+            .expect("b")
+            .expect("b exists");
+        pager
+            .rollback_to_named_savepoint("a")
+            .expect("a")
+            .expect("a exists");
+    });
+    assert_eq!(h.one("SELECT n FROM t WHERE id = 5"), 0);
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT n FROM t WHERE id = 5"), 0);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+}
+
+/// Review M1/M4: a savepoint restore that runs out of slots every other
+/// run parks and resumes (the page-1 header read re-entered before its
+/// read landed included) instead of asserting.
+#[test]
+fn rollback_parks_and_resumes_without_assert() {
+    let mut h = H::open(Cfg {
+        slots: 48,
+        ..Cfg::default()
+    });
+    h.fill("t", 200);
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    let before = h.stats();
+    h.squeeze_every = 2;
+    h.ok("ROLLBACK TO a");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.squeeze_every = 0;
+    let s = h.stats();
+    assert!(s.restored_pages > before.restored_pages, "{s:?}");
+    assert!(s.parks > before.parks, "parked: {s:?}");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+}
+
+/// Review C7: a savepoint restore that cannot finish (the store fails its
+/// scratch reads) aborts the transaction on the store and rolls the
+/// connection back whole; nothing of it commits.
+#[test]
+fn rollback_that_cannot_finish_aborts_the_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 40);
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 5 WHERE id <= 8");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    h.r.store.fail_scratch_reads = true;
+    let before = h.stats();
+    // The rollback itself only queues the restore; the statement that
+    // next touches a page finds the restore failed.
+    let res = h
+        .exec("ROLLBACK TO a")
+        .and_then(|_| h.exec("SELECT sum(n) FROM t"));
+    let err = res.expect_err("the restore fails");
+    h.r.store.fail_scratch_reads = false;
+    assert!(
+        err.to_string().contains("stream"),
+        "the restore's read error, got {err}"
+    );
+    let s = h.stats();
+    assert!(
+        s.doomed > before.doomed && s.aborts > before.aborts,
+        "{s:?}"
+    );
+    assert!(h.conn.get_auto_commit(), "the transaction was rolled back");
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    // The connection writes again.
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
+    h.integrity();
+}
+
+/// Review C3: a reader whose version was trimmed before its pin landed
+/// fails that statement with SQLITE_BUSY; the handle (and the writer) is
+/// fine and the reader's next statement reads the new head.
+#[test]
+fn trimmed_pin_fails_only_that_statement_busy() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    h.r.store.trimmed_below = h.r.store.head() + 1;
+    let err = h
+        .exec_on(&c2, "SELECT count(*) FROM t", &[])
+        .expect_err("the version is gone");
+    assert_eq!(err.sqlite_result_code(), 5, "SQLITE_BUSY, got {err}");
+    h.r.store.trimmed_below = 0;
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    let rows = h.exec_on(&c2, "SELECT sum(n) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 1);
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
+    h.check_invariants();
+}
+
+/// Review: `cache_insert` in stream mode accepts the page already cached
+/// (a re-entry) and refuses a second `Page` for the same id.
+#[test]
+fn stream_cache_insert_refuses_a_second_page_object() {
+    let mut h = H::open(Cfg::default());
+    h.fill("t", 2);
+    let pager = h.conn.pager.load().clone();
+    let cached = pager.stream_test_cached(1).expect("page 1 is cached");
+    assert!(pager.stream_test_cache_insert(1, cached).is_ok());
+    let other = Arc::new(crate::storage::pager::Page::new(1));
+    assert!(pager.stream_test_cache_insert(1, other).is_err());
+}
+
+/// Review C4/C5: with the fewest credits writes need, and an escrow that
+/// is topped up only a little at a time and then shrinks, every run stays
+/// within its credits (the runner checks), the store is never overdrawn
+/// (it panics), and a transaction past the grant fails SQLITE_FULL and
+/// leaves the committed state alone.
+#[test]
+fn low_credits_and_shrinking_grant() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        credits: super::MIN_CREDITS,
+        quota: 4_000,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    h.ok("ROLLBACK TO a");
+    h.ok("UPDATE t SET n = 2 WHERE id <= 40");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 80);
+    let head = h.r.store.head();
+    // The grant shrinks to a few pages: a large transaction cannot fit.
+    h.r.store.allowance = Some(8);
+    h.ok("BEGIN");
+    let res = h.exec("UPDATE t SET n = 9").and_then(|_| h.exec("COMMIT"));
+    let err = res.expect_err("past the grant");
+    assert!(is_full(&err), "expected SQLITE_FULL, got {err}");
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    h.r.store.allowance = Some(4_000);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 80);
+    h.ok("UPDATE t SET n = 0");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
 }

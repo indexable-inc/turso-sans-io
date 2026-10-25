@@ -29,7 +29,8 @@ pub use wal::StreamWal;
 
 use crate::io::{Buffer, Completion};
 use crate::storage::buffer_pool::BufferPool;
-use crate::sync::{Arc, Mutex};
+use crate::storage::page_cache::PageCache;
+use crate::sync::{Arc, Mutex, RwLock, Weak};
 use crate::{CompletionError, LimboError, Result};
 use roaring::RoaringTreemap;
 use std::collections::{BTreeMap, HashMap};
@@ -43,6 +44,10 @@ pub const MAX_READ_PAGES: usize = 16;
 pub const MAX_PART_PAGES: u32 = 1024;
 /// Op credits per run unless the embedder says otherwise.
 pub const DEFAULT_CREDITS: u32 = 256;
+/// The fewest op credits a run must offer for writes to make progress: a
+/// BEGIN, a part's closing op and a read past a mutation's hold (which is
+/// at most a BEGIN and two parts' closing ops for any `R` under 1,024).
+pub const MIN_CREDITS: u32 = 4;
 /// First stream page of the scratch region (subjournal records). It is the
 /// tail of every transaction's page range, never part of the database.
 pub const SCRATCH_BASE: u64 = 1 << 32;
@@ -53,7 +58,8 @@ pub mod op {
     /// [`super::FLAG_AT_VERSION`], else at `Latest` (the writer's staged
     /// parts included). Completes with the byte count.
     pub const READ: u32 = 1;
-    /// Pin version `at` (never fails for a retained version).
+    /// Pin version `at`. Completes with 0, or with [`super::err::LOST`]
+    /// if the version was released before the pin landed (`TRIMMED`).
     pub const PIN: u32 = 2;
     pub const UNPIN: u32 = 3;
     /// Open transaction `txn` over pages `[page, page + count)`.
@@ -144,11 +150,20 @@ pub struct StreamStats {
     pub quota_full: u64,
     /// `IO::step` (or anything else that would block) was called.
     pub blocking_calls: u64,
+    /// An op that needed a credit its reserve should have kept found none.
+    /// Must stay 0.
+    pub credit_short: u64,
+    /// Transactions aborted because a rollback or a staged part could not
+    /// finish (the statement got SQLITE_FULL or SQLITE_IOERR).
+    pub doomed: u64,
 }
 
 pub(crate) enum Pending {
     Read(Completion),
     Notify(Completion),
+    /// A PIN of this version. It fails (`err::LOST`) if the version was
+    /// released before the pin landed (§4: retention 0 keeps only the head).
+    Pin(u64),
 }
 
 #[derive(Default)]
@@ -156,6 +171,9 @@ struct Pin {
     holders: u32,
     /// The PIN op went out (at the first read at this version).
     sent: bool,
+    /// The PIN failed: the version is gone. Reads at it fail
+    /// SQLITE_BUSY, and no UNPIN goes out for it.
+    lost: bool,
 }
 
 struct Txn {
@@ -166,19 +184,37 @@ struct Txn {
     live: RoaringTreemap,
 }
 
+/// A page cache of one connection, for eviction across connections (they
+/// share the arena).
+pub(crate) type SharedCache = RwLock<PageCache>;
+
 struct Inner {
     head: u64,
     ops: Vec<StreamOp>,
     pending: HashMap<u64, Pending>,
     next_tag: u64,
+    /// Op credits left in this run.
     credits: u32,
+    /// Credits promised to the writer's current mutation (its subjournal
+    /// records, `stream_reserve`). Reads and spills leave them alone; the
+    /// record stages use them. Never above `credits`.
+    hold: u32,
     notify: Option<(u64, Completion)>,
-    /// Unstaged writes in the open transaction's current part.
+    /// Unstaged writes in the open transaction's current part. While it is
+    /// above 0 the credit of the op that closes the part (its STAGE, or the
+    /// COMMIT) is already taken.
     part_writes: u32,
-    /// Writes waiting for a BATCH.
+    /// Writes waiting for a BATCH. While above 0 the BATCH's credit is
+    /// already taken.
     batch_writes: u32,
+    /// A discard that waits for the next part (a rollback ran with no
+    /// part open and possibly no credit to open one). It goes out first in
+    /// that part, before any write that could land in its range.
+    pending_discard: Option<(u64, u64)>,
     txn: Option<Txn>,
     next_txn: u32,
+    /// Quota pages this instance may still write: the batch header's
+    /// `quota_pages` at the start of the run, less what this run wrote.
     quota_left: u64,
     pins: BTreeMap<u64, Pin>,
     writer: bool,
@@ -189,6 +225,8 @@ struct Inner {
     stats: StreamStats,
     /// The database size in pages, last seen in a loaded page 1 (0: never).
     size_hint: u32,
+    /// Arena slots promised to mutations, over every connection.
+    reserved_slots: u32,
 }
 
 /// The op list and the state every connection of one database shares.
@@ -196,6 +234,8 @@ pub struct StreamDb {
     pool: Arc<BufferPool>,
     cfg: StreamConfig,
     inner: Mutex<Inner>,
+    /// Every connection's page cache (they all hold slots of one arena).
+    caches: Mutex<Vec<Weak<SharedCache>>>,
 }
 
 impl std::fmt::Debug for StreamDb {
@@ -231,9 +271,11 @@ impl StreamDb {
                 pending: HashMap::new(),
                 next_tag: 1,
                 credits: DEFAULT_CREDITS,
+                hold: 0,
                 notify: None,
                 part_writes: 0,
                 batch_writes: 0,
+                pending_discard: None,
                 txn: None,
                 next_txn: 1,
                 quota_left: cfg.quota_pages,
@@ -243,7 +285,9 @@ impl StreamDb {
                 keep: Vec::new(),
                 stats: StreamStats::default(),
                 size_hint: 0,
+                reserved_slots: 0,
             }),
+            caches: Mutex::new(Vec::new()),
         })
     }
 
@@ -273,11 +317,16 @@ impl StreamDb {
 
     // ---- embedder side -------------------------------------------------
 
-    /// Start a run with `credits` op credits. Call before delivering the
-    /// previous run's completions.
-    pub fn begin_run(&self, credits: u32) {
+    /// Start a run with the batch header's `credits` (free op credits) and
+    /// `quota_pages` (pages this instance may still write; `u64::MAX`: no
+    /// quota). Both are re-read every run: the host tops the grant up, and
+    /// staged parts already left it. Call before delivering the previous
+    /// run's completions.
+    pub fn begin_run(&self, credits: u32, quota_pages: u64) {
         let mut g = self.inner.lock();
         g.credits = credits;
+        g.hold = g.hold.min(credits);
+        g.quota_left = quota_pages;
         g.stats.runs += 1;
     }
 
@@ -289,16 +338,25 @@ impl StreamDb {
             Some(Pending::Read(c)) => {
                 if result >= 0 {
                     c.complete(result as i32);
+                } else if result == err::LOST {
+                    c.error(CompletionError::SnapshotLost);
                 } else {
-                    let msg = if result == err::LOST {
-                        "stream version lost"
-                    } else {
-                        "stream read failed"
-                    };
-                    c.error(CompletionError::IOError(std::io::ErrorKind::Other, msg));
+                    c.error(CompletionError::IOError(
+                        std::io::ErrorKind::Other,
+                        "stream read failed",
+                    ));
                 }
             }
             Some(Pending::Notify(c)) => c.complete(0),
+            Some(Pending::Pin(v)) => {
+                if result < 0 {
+                    // The version is gone; only statements reading at it
+                    // fail (SQLITE_BUSY), the handle is fine.
+                    if let Some(p) = self.inner.lock().pins.get_mut(&v) {
+                        p.lost = true;
+                    }
+                }
+            }
             None => {
                 if result < 0 {
                     // A write-side op failed: the store fails the handle
@@ -327,6 +385,7 @@ impl StreamDb {
                     None => (0, 0),
                 };
                 notified = notify_tag.is_some();
+                // Its credit was taken when the part opened.
                 g.ops.push(StreamOp {
                     kind: op::STAGE,
                     flags,
@@ -361,7 +420,7 @@ impl StreamDb {
         self.inner.lock().keep.push(buf);
     }
 
-    /// Ops issued and not yet completed (reads and the notify).
+    /// Ops issued and not yet completed (reads, pins and the notify).
     pub fn in_flight(&self) -> usize {
         let g = self.inner.lock();
         g.pending.len() + usize::from(g.notify.is_some())
@@ -380,12 +439,131 @@ impl StreamDb {
         self.inner.lock().credits
     }
 
-    fn take_credit(g: &mut Inner) -> bool {
-        if g.credits == 0 {
-            return false;
+    /// Credits a read or a spill may use: what is left past the hold.
+    pub(crate) fn free_credits(&self) -> u32 {
+        let g = self.inner.lock();
+        g.credits.saturating_sub(g.hold)
+    }
+
+    /// Take `n` credits for an op the caller was promised (or checked
+    /// for). Short: a reserve missed it (a fork bug), counted, SQLITE_FULL.
+    fn take_credits(g: &mut Inner, n: u32) -> Result<()> {
+        if g.credits < n {
+            g.stats.credit_short += 1;
+            return Err(full());
         }
-        g.credits -= 1;
-        true
+        g.credits -= n;
+        g.hold = g.hold.min(g.credits);
+        Ok(())
+    }
+
+    /// Credits that `writes` more page writes (or discards) into the
+    /// transaction's parts take: its BEGIN if none is open, and the closing
+    /// op of every part they open. The pending discard counts as a write.
+    fn credits_for(g: &Inner, writes: u64) -> u32 {
+        let writes = writes + u64::from(g.pending_discard.is_some());
+        let begin = u32::from(g.txn.is_none());
+        if writes == 0 {
+            return begin;
+        }
+        let room = if g.part_writes > 0 {
+            u64::from(MAX_PART_PAGES - g.part_writes)
+        } else {
+            0
+        };
+        let rest = writes.saturating_sub(room);
+        begin + u32::try_from(rest.div_ceil(u64::from(MAX_PART_PAGES))).unwrap_or(u32::MAX)
+    }
+
+    pub(crate) fn stage_credits(&self, writes: u64) -> u32 {
+        Self::credits_for(&self.inner.lock(), writes)
+    }
+
+    /// Credits to hold for `writes` record stages that happen later in a
+    /// mutation: like `stage_credits`, but the open part's room is not
+    /// counted, since a read (`Latest`) may stage that part before then.
+    pub(crate) fn hold_credits(&self, writes: u64) -> u32 {
+        let g = self.inner.lock();
+        let writes = writes + u64::from(g.pending_discard.is_some());
+        let begin = u32::from(g.txn.is_none());
+        begin + u32::try_from(writes.div_ceil(u64::from(MAX_PART_PAGES))).unwrap_or(u32::MAX)
+    }
+
+    /// Writes that `budget` credits can stage now.
+    pub(crate) fn writes_within(&self, budget: u32) -> u64 {
+        let g = self.inner.lock();
+        let mut b = budget;
+        if g.txn.is_none() {
+            if b == 0 {
+                return 0;
+            }
+            b -= 1;
+        }
+        let room = if g.part_writes > 0 {
+            u64::from(MAX_PART_PAGES - g.part_writes)
+        } else {
+            0
+        };
+        let writes = room + u64::from(b) * u64::from(MAX_PART_PAGES);
+        writes.saturating_sub(u64::from(g.pending_discard.is_some()))
+    }
+
+    /// Promise `n` credits to the writer's mutation (replaces the hold).
+    pub(crate) fn set_hold(&self, n: u32) {
+        let mut g = self.inner.lock();
+        g.hold = n.min(g.credits);
+    }
+
+    /// Promise at least `n` credits (a nested reserve inside a mutation).
+    pub(crate) fn raise_hold(&self, n: u32) {
+        let mut g = self.inner.lock();
+        g.hold = g.hold.max(n).min(g.credits);
+    }
+
+    // ---- slots shared by every connection --------------------------------
+
+    pub(crate) fn register_cache(&self, cache: &Arc<SharedCache>) {
+        let mut caches = self.caches.lock();
+        caches.retain(|w| w.strong_count() > 0);
+        caches.push(Arc::downgrade(cache));
+    }
+
+    /// Evict clean pages from the other connections' caches until `want`
+    /// slots are free. Returns pages evicted.
+    pub(crate) fn evict_others(&self, own: &Arc<SharedCache>, want: u32) -> u64 {
+        let caches: Vec<Arc<SharedCache>> = {
+            let mut caches = self.caches.lock();
+            caches.retain(|w| w.strong_count() > 0);
+            caches.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut n = 0;
+        for c in caches {
+            if Arc::ptr_eq(&c, own) {
+                continue;
+            }
+            // A cache locked further up this call stack is skipped.
+            let Some(mut cache) = c.try_write() else {
+                continue;
+            };
+            while self.pool.page_slots().1 < want && cache.evict_one_page() {
+                n += 1;
+            }
+            if self.pool.page_slots().1 >= want {
+                break;
+            }
+        }
+        self.bump(|s| s.evictions += n);
+        n
+    }
+
+    pub(crate) fn reserved_slots(&self) -> u32 {
+        self.inner.lock().reserved_slots
+    }
+
+    /// One connection's reservation went from `old` to `new` slots.
+    pub(crate) fn move_reserved(&self, old: u32, new: u32) {
+        let mut g = self.inner.lock();
+        g.reserved_slots = (g.reserved_slots + new).saturating_sub(old);
     }
 
     /// A completion finished at the start of the next run (the store's
@@ -403,8 +581,13 @@ impl StreamDb {
         c
     }
 
+    /// Credits a read at `at` takes now (the read, and a pin first).
+    fn read_need(g: &Inner, at: ReadAt) -> u32 {
+        1 + u32::from(matches!(at, ReadAt::Version(v) if !g.pins.get(&v).is_some_and(|p| p.sent)))
+    }
+
     /// Issue a read of one page (`page` is the stream page) into `buf`.
-    /// `None`: no credit left this run (the caller parks).
+    /// `None`: no credit left this run past the hold (the caller parks).
     pub(crate) fn read(
         &self,
         at: ReadAt,
@@ -414,24 +597,26 @@ impl StreamDb {
     ) -> Result<Option<Completion>> {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
-        // A pin and a stage may go first.
-        let unpinned = |g: &Inner, v: u64| !g.pins.get(&v).is_some_and(|p| p.sent);
-        let need = 1
-            + u32::from(matches!(at, ReadAt::Version(v) if unpinned(&g, v)))
-            + u32::from(matches!(at, ReadAt::Latest) && g.part_writes > 0);
-        if g.credits < need {
+        if let ReadAt::Version(v) = at {
+            if g.pins.get(&v).is_some_and(|p| p.lost) {
+                // The snapshot is gone: this statement fails SQLITE_BUSY.
+                return Err(LimboError::CompletionError(CompletionError::SnapshotLost));
+            }
+        }
+        let need = Self::read_need(&g, at);
+        if g.credits < need + g.hold {
             return Ok(None);
         }
         match at {
             ReadAt::Latest => {
                 if g.part_writes > 0 {
-                    // Read-your-staged-writes covers staged parts only.
+                    // Read-your-staged-writes covers staged parts only. The
+                    // stage's credit was taken when the part opened.
                     let txn = g
                         .txn
                         .as_ref()
                         .map(|t| t.id)
                         .expect("part writes imply a txn");
-                    Self::take_credit(&mut g);
                     g.ops.push(StreamOp {
                         kind: op::STAGE,
                         txn,
@@ -442,19 +627,23 @@ impl StreamDb {
                 }
             }
             ReadAt::Version(v) => {
-                if unpinned(&g, v) {
-                    Self::take_credit(&mut g);
+                if !g.pins.get(&v).is_some_and(|p| p.sent) {
+                    Self::take_credits(&mut g, 1)?;
+                    let tag = g.next_tag;
+                    g.next_tag += 1;
                     g.ops.push(StreamOp {
                         kind: op::PIN,
+                        tag,
                         at: v,
                         ..Default::default()
                     });
+                    g.pending.insert(tag, Pending::Pin(v));
                     g.pins.entry(v).or_default().sent = true;
                     g.stats.pins += 1;
                 }
             }
         }
-        Self::take_credit(&mut g);
+        Self::take_credits(&mut g, 1)?;
         let tag = g.next_tag;
         g.next_tag += 1;
         let (flags, at) = match at {
@@ -490,9 +679,11 @@ impl StreamDb {
         };
         p.holders = p.holders.saturating_sub(1);
         if p.holders == 0 {
-            let sent = p.sent;
+            let unpin = p.sent && !p.lost;
             g.pins.remove(&v);
-            if sent {
+            if unpin {
+                // UNPIN needs no credit (it never completes, and a guest
+                // must always be able to let go).
                 g.ops.push(StreamOp {
                     kind: op::UNPIN,
                     at: v,
@@ -528,60 +719,105 @@ impl StreamDb {
         self.inner.lock().txn.is_some()
     }
 
-    /// Credits a commit of `pages` pages needs (begin, stages, commit).
-    pub(crate) fn commit_credits(&self, pages: u32) -> u32 {
+    /// Stream pages among `pages` this transaction has not debited yet
+    /// (what staging them costs in quota).
+    pub(crate) fn fresh_pages(&self, pages: impl Iterator<Item = u64>) -> u64 {
         let g = self.inner.lock();
-        let parts = (g.part_writes + pages).div_ceil(MAX_PART_PAGES);
-        parts + 2
+        match &g.txn {
+            Some(t) => pages.filter(|p| !t.ever.contains(*p)).count() as u64,
+            None => pages.count() as u64,
+        }
     }
 
-    fn ensure_txn(&self, g: &mut Inner) -> Result<u32> {
-        if let Some(t) = &g.txn {
-            return Ok(t.id);
+    /// Make room in the current part for one more write: BEGIN the
+    /// transaction if none is open, take the closing op's credit if the part
+    /// is new, and put a pending discard first in it.
+    fn open_part(&self, g: &mut Inner) -> Result<u32> {
+        loop {
+            let begin = g.txn.is_none();
+            let need = u32::from(begin) + u32::from(g.part_writes == 0);
+            Self::take_credits(g, need)?;
+            if begin {
+                let id = g.next_txn;
+                g.next_txn += 1;
+                let end = SCRATCH_BASE + self.cfg.scratch_pages as u64;
+                g.ops.push(StreamOp {
+                    kind: op::BEGIN,
+                    txn: id,
+                    page: 0,
+                    count: 0,
+                    at: end,
+                    ..Default::default()
+                });
+                g.txn = Some(Txn {
+                    id,
+                    ever: RoaringTreemap::new(),
+                    live: RoaringTreemap::new(),
+                });
+            }
+            let txn = g.txn.as_ref().expect("opened above").id;
+            let Some((start, end)) = g.pending_discard.take() else {
+                return Ok(txn);
+            };
+            Self::push_discard(g, txn, start, end);
+            if g.part_writes > 0 {
+                return Ok(txn);
+            }
+            // The discard filled the part; open the next one.
         }
-        if !Self::take_credit(g) {
-            return Err(LimboError::InternalError(
-                "stream: no credit to begin a transaction".into(),
-            ));
+    }
+
+    /// Count one op into the current part; a full part is staged (its
+    /// credit was taken when it opened).
+    fn part_count(g: &mut Inner, txn: u32) {
+        g.part_writes += 1;
+        if g.part_writes >= MAX_PART_PAGES {
+            g.ops.push(StreamOp {
+                kind: op::STAGE,
+                txn,
+                ..Default::default()
+            });
+            g.part_writes = 0;
+            g.stats.parts += 1;
         }
-        let id = g.next_txn;
-        g.next_txn += 1;
-        let end = SCRATCH_BASE + self.cfg.scratch_pages as u64;
+    }
+
+    fn push_discard(g: &mut Inner, txn: u32, start: u64, end: u64) {
+        if let Some(t) = g.txn.as_mut() {
+            t.live.remove_range(start..end);
+        }
+        let count = u32::try_from(end - start).unwrap_or(u32::MAX);
         g.ops.push(StreamOp {
-            kind: op::BEGIN,
-            txn: id,
-            page: 0,
-            count: 0,
-            at: end,
+            kind: op::DISCARD,
+            txn,
+            page: start,
+            count,
             ..Default::default()
         });
-        g.txn = Some(Txn {
-            id,
-            ever: RoaringTreemap::new(),
-            live: RoaringTreemap::new(),
-        });
-        Ok(id)
+        g.stats.discards += 1;
+        Self::part_count(g, txn);
     }
 
     /// Stage one page write in the open transaction (opening it first).
     /// `Ok(false)`: the quota allowance is spent (SQLITE_FULL), nothing
-    /// was written.
+    /// was written. The credits it takes were reserved by the caller.
     pub(crate) fn stage_write(&self, page: u64, buf: &Arc<Buffer>) -> Result<bool> {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
-        let txn = self.ensure_txn(&mut g)?;
+        let fresh = !g.txn.as_ref().is_some_and(|t| t.ever.contains(page));
+        if fresh && g.quota_left == 0 {
+            g.stats.quota_full += 1;
+            return Ok(false);
+        }
+        let txn = self.open_part(&mut g)?;
         let t = g.txn.as_mut().expect("opened above");
-        let fresh = !t.ever.contains(page);
         if fresh {
-            if g.quota_left == 0 {
-                g.stats.quota_full += 1;
-                return Ok(false);
-            }
-            g.quota_left -= 1;
-            let t = g.txn.as_mut().expect("opened above");
             t.ever.insert(page);
         }
-        g.txn.as_mut().expect("opened above").live.insert(page);
+        t.live.insert(page);
+        if fresh {
+            g.quota_left -= 1;
+        }
         self.pool.lend(buf);
         g.keep.push(buf.clone());
         g.ops.push(StreamOp {
@@ -593,59 +829,59 @@ impl StreamDb {
             len: buf.len() as u64,
             ..Default::default()
         });
-        g.part_writes += 1;
         g.stats.writes += 1;
-        if g.part_writes >= MAX_PART_PAGES {
-            // Staging costs a credit; the part closes even without one at
-            // the end of the run (take_ops), so this never fails.
-            if Self::take_credit(&mut g) {
-                g.ops.push(StreamOp {
-                    kind: op::STAGE,
-                    txn,
-                    ..Default::default()
-                });
-                g.part_writes = 0;
-                g.stats.parts += 1;
-            }
-        }
+        Self::part_count(&mut g, txn);
         Ok(true)
     }
 
-    /// Discard stream pages `[start, end)` in the open transaction.
-    pub(crate) fn stage_discard(&self, start: u64, end: u64) -> Result<()> {
+    /// Discard stream pages `[start, end)` in the open transaction. With no
+    /// part open it waits for the next one (it needs no credit now, so a
+    /// synchronous rollback can always issue it).
+    pub(crate) fn stage_discard(&self, start: u64, end: u64) {
         if start >= end {
-            return Ok(());
+            return;
         }
         let mut g = self.inner.lock();
-        let Some(t) = g.txn.as_mut() else {
-            return Ok(());
+        let Some(txn) = g.txn.as_ref().map(|t| t.id) else {
+            return;
         };
-        t.live.remove_range(start..end);
-        let txn = t.id;
-        let count = u32::try_from(end - start).unwrap_or(u32::MAX);
-        g.ops.push(StreamOp {
-            kind: op::DISCARD,
-            txn,
-            page: start,
-            count,
-            ..Default::default()
+        if g.part_writes > 0 {
+            if let Some((s, e)) = g.pending_discard.take() {
+                Self::push_discard(&mut g, txn, s, e);
+            }
+            if g.part_writes > 0 {
+                Self::push_discard(&mut g, txn, start, end);
+                return;
+            }
+        }
+        if let Some(t) = g.txn.as_mut() {
+            t.live.remove_range(start..end);
+        }
+        g.pending_discard = Some(match g.pending_discard {
+            Some((s, e)) => (s.min(start), e.max(end)),
+            None => (start, end),
         });
-        g.part_writes += 1;
-        g.stats.discards += 1;
-        Ok(())
     }
 
     /// Commit the open transaction (its current part is the last part).
-    /// Returns the new version.
+    /// Returns the new version. The caller checked the credits
+    /// (`stage_credits` + 1).
     pub(crate) fn txn_commit(&self) -> Result<u64> {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
+        if g.pending_discard.is_some() {
+            self.open_part(&mut g)?;
+        }
+        if g.part_writes == 0 {
+            // No part open: the COMMIT takes its own credit.
+            Self::take_credits(&mut g, 1)?;
+        }
         let t = g.txn.take().expect("txn_commit without a transaction");
         let v = g.head + 1;
         g.head = v;
         // Pages a later part discarded are refunded, like the store does.
-        g.quota_left += t.ever.len() - t.ever.intersection_len(&t.live);
-        let _ = Self::take_credit(&mut g);
+        let refund = t.ever.len() - t.ever.intersection_len(&t.live);
+        g.quota_left = g.quota_left.saturating_add(refund);
         g.ops.push(StreamOp {
             kind: op::COMMIT,
             txn: t.id,
@@ -657,10 +893,13 @@ impl StreamDb {
         Ok(v)
     }
 
+    /// Abort the open transaction (ABORT never completes and needs no
+    /// credit: a guest can always give up a transaction).
     pub(crate) fn txn_abort(&self) {
         let mut g = self.inner.lock();
+        g.pending_discard = None;
         if let Some(t) = g.txn.take() {
-            g.quota_left += t.ever.len();
+            g.quota_left = g.quota_left.saturating_add(t.ever.len());
             g.ops.push(StreamOp {
                 kind: op::ABORT,
                 txn: t.id,
@@ -671,13 +910,18 @@ impl StreamDb {
         }
     }
 
-    /// Queue a page for the next plain batch. `Ok(false)`: no quota.
+    /// Queue a page for the next plain batch. `Ok(false)`: no quota. The
+    /// first write of a batch takes the BATCH's credit (checked by the
+    /// caller).
     pub(crate) fn batch_write(&self, page: u64, buf: &Arc<Buffer>) -> Result<bool> {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
         if g.quota_left == 0 {
             g.stats.quota_full += 1;
             return Ok(false);
+        }
+        if g.batch_writes == 0 {
+            Self::take_credits(&mut g, 1)?;
         }
         g.quota_left -= 1;
         self.pool.lend(buf);
@@ -696,25 +940,41 @@ impl StreamDb {
         Ok(true)
     }
 
-    /// Undo queued batch writes (a commit that failed on quota midway).
+    /// Undo the writes queued for the next batch (a commit that failed on
+    /// quota midway). Only the writes after this run's last BATCH: earlier
+    /// ones belong to a batch already committed (the page-1 init is
+    /// version 1, often in the same run as the first commit).
     pub(crate) fn batch_cancel(&self) {
         let mut g = self.inner.lock();
+        let from = g
+            .ops
+            .iter()
+            .rposition(|o| o.kind == op::BATCH)
+            .map_or(0, |i| i + 1);
         let mut n = 0u64;
+        let mut i = 0usize;
         g.ops.retain(|o| {
-            let drop = o.kind == op::WRITE && o.txn == 0;
+            let drop = i >= from && o.kind == op::WRITE && o.txn == 0;
+            i += 1;
             n += u64::from(drop);
             !drop
         });
-        g.quota_left += n;
+        g.quota_left = g.quota_left.saturating_add(n);
+        if g.batch_writes > 0 {
+            // The BATCH's credit, taken by the first write.
+            g.credits += 1;
+        }
         g.batch_writes = 0;
     }
 
     pub(crate) fn batch_commit(&self) -> Result<u64> {
         let mut g = self.inner.lock();
         Self::check_failed(&g)?;
+        if g.batch_writes == 0 {
+            Self::take_credits(&mut g, 1)?;
+        }
         let v = g.head + 1;
         g.head = v;
-        let _ = Self::take_credit(&mut g);
         g.ops.push(StreamOp {
             kind: op::BATCH,
             at: v,
