@@ -119,6 +119,8 @@ pub enum LimboError {
     },
     #[error("string or blob too big")]
     TooBig,
+    #[error("value too long for type {0}")]
+    ValueTooLong(String),
     #[error("database table is locked")]
     TableLocked,
     #[error("attempt to write a readonly database")]
