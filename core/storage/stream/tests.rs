@@ -1680,3 +1680,288 @@ fn rollback_detaches_a_locked_grown_page() {
     assert_eq!(h.one("SELECT count(*) FROM t"), 40);
     h.integrity();
 }
+
+// ---- final review, round 3 (reviewer repros) -------------------------------
+
+const BIG_INSERT2: &str = "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 5000 UNION ALL SELECT i + 1 FROM c WHERE i < 6200) \
+     SELECT i, 7, zeroblob(900) FROM c";
+
+/// Step `sql` on `conn` to the end; `Err` names the failure.
+fn rv_step_all(h: &mut H, conn: &Arc<Connection>, sql: &str) -> std::result::Result<(), String> {
+    let mut stmt = h.r.run(|| conn.prepare(sql)).map_err(|e| e.to_string())?;
+    for _ in 0..100_000 {
+        let r = h.r.run(|| -> crate::Result<Option<StepResult>> {
+            loop {
+                match stmt.step()? {
+                    StepResult::Row => {}
+                    StepResult::IO | StepResult::Yield => return Ok(None),
+                    o => return Ok(Some(o)),
+                }
+            }
+        });
+        match r {
+            Ok(None) => {}
+            Ok(Some(StepResult::Done)) => return Ok(()),
+            Ok(Some(o)) => return Err(format!("{o:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("no progress".into())
+}
+
+/// A connection dropped (not closed) inside BEGIN after it spilled.
+fn drop_a_spilled_writer(h: &mut H, sql: &str) {
+    let c2 = h.connect();
+    h.exec_on(&c2, "BEGIN", &[]).unwrap();
+    h.exec_on(&c2, sql, &[]).unwrap();
+    assert!(h.stats().spilled_pages > 0, "{:?}", h.stats());
+    assert!(h.sdb.txn_open());
+    drop(c2);
+}
+
+/// Rows of `t` with ids in `[lo, hi]`, read by a fresh connection.
+fn fresh_count(h: &mut H, lo: i64, hi: i64) -> i64 {
+    let c = h.connect();
+    let rows = h
+        .exec_on(&c, &format!("SELECT count(*) FROM t WHERE id BETWEEN {lo} AND {hi}"), &[])
+        .unwrap();
+    int(&rows[0][0])
+}
+
+/// Round 3 C1: a writer dropped mid-transaction leaves no store
+/// transaction open, and the next writer (recording, in BEGIN) commits
+/// only its own change.
+#[test]
+fn rv_dropped_writer_then_recording_writer() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    drop_a_spilled_writer(&mut h, BIG_INSERT);
+    assert!(!h.sdb.txn_open(), "a dropped writer left its store txn open");
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    h.ok("COMMIT");
+    assert_eq!(fresh_count(&mut h, 1, 1_000_000), 40);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
+    h.integrity();
+}
+
+/// The next writer after a dropped one is a plain autocommit statement.
+#[test]
+fn rv_dropped_writer_then_autocommit_writer() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    drop_a_spilled_writer(&mut h, BIG_INSERT);
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    h.ok("UPDATE t SET n = 1 WHERE id = 2");
+    assert_eq!(fresh_count(&mut h, 1000, 2200), 0);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 2);
+    h.integrity();
+}
+
+/// Contrast: close() aborts the transaction too.
+#[test]
+fn rv_closed_writer_aborts_its_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    h.exec_on(&c2, "BEGIN", &[]).unwrap();
+    h.exec_on(&c2, BIG_INSERT, &[]).unwrap();
+    h.r.run(|| c2.close()).unwrap();
+    drop(c2);
+    assert!(!h.sdb.txn_open(), "close left the store txn open");
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
+    h.integrity();
+}
+
+/// A dropped writer, then a writer that spills too: only the second
+/// transaction's rows are committed.
+#[test]
+fn rv_dropped_writer_then_spilling_writer() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    drop_a_spilled_writer(&mut h, BIG_INSERT);
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT2);
+    h.ok("COMMIT");
+    assert_eq!(fresh_count(&mut h, 1000, 2200), 0);
+    assert_eq!(fresh_count(&mut h, 5000, 6200), 1201);
+    h.integrity();
+}
+
+/// A dropped writer, then an autocommit insert of more than one part.
+#[test]
+fn rv_dropped_writer_then_autocommit_spill() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    drop_a_spilled_writer(&mut h, BIG_INSERT);
+    h.ok(BIG_INSERT2);
+    assert_eq!(fresh_count(&mut h, 1000, 2200), 0);
+    assert_eq!(fresh_count(&mut h, 5000, 6200), 1201);
+    h.integrity();
+}
+
+/// The reviewer's repro: a dropped writer's spilled UPDATE of existing
+/// pages must not reach another writer's acked commit.
+#[test]
+fn rv_dropped_updater_leaks_into_next_commit() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    drop_a_spilled_writer(&mut h, "UPDATE t SET n = 5");
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT2);
+    h.ok("COMMIT");
+    let c = h.connect();
+    let rows = h
+        .exec_on(&c, "SELECT count(*), sum(n) FROM t WHERE id <= 400", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0][0]), 400);
+    assert_eq!(
+        int(&rows[0][1]),
+        0,
+        "a dropped connection's uncommitted UPDATE was committed by another writer"
+    );
+    integrity_on(&mut h, &c);
+}
+
+/// A reader's SAVEPOINT / ROLLBACK TO / ROLLBACK between the steps of a
+/// writer's statement that is spilling.
+#[test]
+fn rv_reader_rollback_mid_writer_statement() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    let w = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT w");
+    let mut stmt = h.r.run(|| w.prepare(BIG_INSERT)).unwrap();
+    let mut rounds = 0;
+    while !step_for(&mut h, &mut stmt, 3).unwrap() {
+        rounds += 1;
+        h.exec_on(&c2, "SAVEPOINT r", &[]).unwrap();
+        h.exec_on(&c2, "SELECT count(*) FROM t", &[]).unwrap();
+        h.exec_on(&c2, "ROLLBACK TO r", &[]).unwrap();
+        h.exec_on(&c2, "ROLLBACK", &[]).unwrap();
+    }
+    drop(stmt);
+    assert!(rounds > 0 && h.stats().spilled_pages > 0);
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40 + 1201);
+    h.integrity();
+    integrity_on(&mut h, &c2);
+}
+
+/// A trigger spills from a nested statement in autocommit while a reader
+/// rolls back savepoints between the writer's steps.
+#[test]
+fn rv_trigger_spill_with_reader_rollbacks() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    h.ok("CREATE TABLE u(id INTEGER PRIMARY KEY, v BLOB)");
+    h.ok("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO u(v) VALUES (zeroblob(900)); END");
+    let c2 = h.connect();
+    let w = h.conn.clone();
+    let mut stmt = h.r.run(|| w.prepare(BIG_INSERT)).unwrap();
+    while !step_for(&mut h, &mut stmt, 2).unwrap() {
+        h.exec_on(&c2, "SAVEPOINT r", &[]).unwrap();
+        h.exec_on(&c2, "SELECT count(*) FROM u", &[]).unwrap();
+        h.exec_on(&c2, "ROLLBACK TO r", &[]).unwrap();
+        h.exec_on(&c2, "RELEASE r", &[]).unwrap();
+    }
+    drop(stmt);
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40 + 1201);
+    assert_eq!(h.one("SELECT count(*) FROM u"), 1201);
+    h.integrity();
+}
+
+/// Resetting a writer's statement while its reads are in flight, then
+/// using the connection again and committing; and dropping a reader
+/// with reads in flight.
+#[test]
+fn rv_reset_mid_io_then_continue() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        read_delay: 3,
+        ..Cfg::default()
+    });
+    h.fill("t", 30);
+    let w = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 2 WHERE id = 1");
+    for k in 0..5 {
+        let mut stmt = h.r.run(|| w.prepare("UPDATE t SET n = n + 1")).unwrap();
+        let _ = step_for(&mut h, &mut stmt, 2 + k).unwrap();
+        let _ = h.r.run(|| stmt.reset());
+        drop(stmt);
+    }
+    let c2 = h.connect();
+    h.exec_on(&c2, "BEGIN", &[]).unwrap();
+    {
+        let mut s2 = h.r.run(|| c2.prepare("SELECT sum(length(v)) FROM t")).unwrap();
+        let _ = step_for(&mut h, &mut s2, 1);
+        drop(s2);
+    }
+    drop(c2);
+    if !h.conn.get_auto_commit() {
+        h.ok("COMMIT");
+    }
+    for _ in 0..8 {
+        h.r.run(|| {});
+    }
+    assert_eq!(fresh_count(&mut h, 1, 1_000_000), 120);
+    h.integrity();
+}
+
+/// A losing writer (Busy) rolls back while the winner has spilled parts:
+/// the winner's transaction is untouched and commits whole.
+#[test]
+fn rv_losing_writer_rollback_keeps_winner2() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    rv_step_all(&mut h, &c2, "BEGIN").unwrap();
+    rv_step_all(&mut h, &c2, "SELECT count(*) FROM t").unwrap();
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT);
+    let aborts = h.stats().aborts;
+    let _ = rv_step_all(&mut h, &c2, "INSERT INTO t(id, n, v) VALUES (99999, 0, 1)");
+    let _ = rv_step_all(&mut h, &c2, "ROLLBACK");
+    let _ = rv_step_all(&mut h, &c2, "BEGIN IMMEDIATE");
+    if !c2.get_auto_commit() {
+        let _ = rv_step_all(&mut h, &c2, "ROLLBACK");
+    }
+    assert_eq!(h.stats().aborts, aborts, "the loser aborted the winner's txn");
+    assert!(h.sdb.txn_open());
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40 + 1201);
+    h.integrity();
+}

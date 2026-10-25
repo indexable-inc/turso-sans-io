@@ -53,6 +53,8 @@ pub(crate) struct StreamPager {
 /// Credit parks in a row before a reserve gives up (SQLITE_FULL): about
 /// this many runs with a grant too small for what the statement holds.
 const CREDIT_PARK_LIMIT: u32 = 64;
+/// The same while a savepoint restore is pending.
+const RESTORE_CREDIT_PARK_LIMIT: u32 = 1024;
 
 #[derive(Default)]
 struct StreamPagerState {
@@ -82,6 +84,8 @@ struct StreamPagerState {
     /// Credit parks in a row (a run's credits short of what a run with the
     /// largest grant seen would have) since the last reserve that finished.
     credit_parks: u32,
+    /// A savepoint restore is being driven (see `stream_gate`).
+    restoring: bool,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
@@ -211,8 +215,10 @@ impl Pager {
 
     /// Is the store's open transaction the one this connection opened?
     fn stream_owns_txn(&self) -> bool {
-        let mine = self.sp().st.lock().txn;
-        mine.is_some() && mine == self.sp().db.txn_id()
+        // The store's one transaction is the write-lock holder's, whether
+        // or not this connection noted it (a commit that opened it and
+        // failed still owns it).
+        self.holds_write_lock() && self.sp().db.txn_open()
     }
 
     /// A stage went into the store's open transaction: it is this
@@ -227,16 +233,28 @@ impl Pager {
     /// so a grant that shrank for good would otherwise park for ever.
     /// Past the limit, SQLITE_FULL.
     fn stream_credit_park(&self) -> IOResultOr<()> {
+        self.stream_credit_park_or(|| stream::full())
+    }
+
+    /// [`Self::stream_credit_park`], failing with `give_up()` past the
+    /// limit. A pending savepoint restore gets a larger limit: giving it up
+    /// dooms the whole transaction.
+    fn stream_credit_park_or(&self, give_up: impl FnOnce() -> LimboError) -> IOResultOr<()> {
         let db = &self.sp().db;
-        let n = {
+        let (n, limit) = {
             let mut st = self.sp().st.lock();
             st.credit_parks += 1;
-            st.credit_parks
+            let limit = if st.restoring {
+                RESTORE_CREDIT_PARK_LIMIT
+            } else {
+                CREDIT_PARK_LIMIT
+            };
+            (st.credit_parks, limit)
         };
-        if n > CREDIT_PARK_LIMIT {
+        if n > limit {
             self.sp().st.lock().credit_parks = 0;
             db.bump(|s| s.reserve_full += 1);
-            return Err(stream::full().into());
+            return Err(give_up().into());
         }
         db.bump_credit_wait();
         io_yield_one!(db.park());
@@ -711,8 +729,9 @@ impl Pager {
             .and_then(|w| w.stream_read_at())
             .unwrap_or(ReadAt::Latest);
         if !db.can_read(at) {
-            db.bump_credit_wait();
-            io_yield_one!(db.park());
+            // Bounded like the other credit parks; a read that can never
+            // go out fails SQLITE_BUSY (nothing is lost, retry later).
+            return self.stream_credit_park_or(|| LimboError::Busy);
         }
         let own = db.claim(self.stream_key()).slots;
         return_if_io!(self.stream_ensure_slots(1 + own));
@@ -811,7 +830,10 @@ impl Pager {
         let Some(mut r) = sp.st.lock().restore.take() else {
             return Ok(IOResult::Done(()));
         };
-        match self.stream_drive_restore(&mut r) {
+        sp.st.lock().restoring = true;
+        let res = self.stream_drive_restore(&mut r);
+        sp.st.lock().restoring = false;
+        match res {
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
             Ok(IOResult::IO(c)) => {
                 sp.st.lock().restore = Some(r);
@@ -1070,7 +1092,7 @@ impl Pager {
             for page in &pages {
                 let buf = page.get().buffer().cloned().expect("dirty page is loaded");
                 match db.stage_write(page.get().id() as u64 - 1, &buf) {
-                    Ok(true) => {}
+                    Ok(true) => self.stream_note_txn(),
                     Ok(false) => return Err(self.stream_doom(stream::full()).into()),
                     Err(e) => return Err(self.stream_doom(e).into()),
                 }

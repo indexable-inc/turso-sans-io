@@ -138,6 +138,10 @@ impl Wal for StreamWal {
             }
         }
         self.writing.store(true, Ordering::Release);
+        // Only a writer opens a store transaction, and none holds the lock
+        // now: one still open is a gone writer's (a connection dropped
+        // mid-transaction). It must never carry into this one.
+        self.db.txn_abort();
         Ok(())
     }
 
@@ -149,6 +153,9 @@ impl Wal for StreamWal {
 
     fn end_write_tx(&self) {
         if self.writing.swap(false, Ordering::AcqRel) {
+            // A write transaction that ends without its commit (a dropped
+            // connection, a rollback) leaves nothing open on the store.
+            self.db.txn_abort();
             // Our own commit moved the head: our cache already matches it.
             let head = self.db.head();
             self.seen.store(head, Ordering::Release);
