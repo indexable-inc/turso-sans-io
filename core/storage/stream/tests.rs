@@ -3649,6 +3649,9 @@ mod stream_fuzz {
                         }
                         StepResult::Done => return Ok(true),
                         StepResult::IO | StepResult::Yield => return Ok(false),
+                        // SQLITE_BUSY is an outcome like any error here,
+                        // as `Statement::run_ignore_rows` reports it.
+                        StepResult::Busy => return Err(LimboError::Busy),
                         other => panic!("unexpected step result {other:?}"),
                     }
                 }
@@ -3864,16 +3867,26 @@ fn stream_fuzz_seeds() {
 /// refuses to block, so the statement failed "Internal error: stream IO
 /// never blocks" in place of SQLITE_FULL. The rebalance now yields until the
 /// read is done and then fails with the read's own error. These seeds of
-/// the fuzz above hit that path, with the squeeze hook off.
+/// the fuzz above hit that path, with the squeeze hook off; each must
+/// take the wait (a yield on an earlier read after the error), not only
+/// fail a DELETE.
 #[test]
 fn delete_rebalance_sibling_read_error_is_not_blocking() {
+    use crate::storage::btree::sibling_error_stats;
     for seed in [86, 123, 180] {
+        let (errors, waits) = sibling_error_stats::get();
         let log = stream_fuzz::one_seed(seed);
+        let (errors_after, waits_after) = sibling_error_stats::get();
         assert!(
             log.iter()
                 .any(|l| l.contains("DELETE") && l.contains("-> err 13 ")),
             "seed {seed}: no DELETE failed SQLITE_FULL\n{}",
             log.join("\n")
+        );
+        assert!(
+            errors_after > errors && waits_after > waits,
+            "seed {seed}: the sibling error wait did not run (errors {errors} -> \
+             {errors_after}, waits {waits} -> {waits_after})"
         );
     }
 }

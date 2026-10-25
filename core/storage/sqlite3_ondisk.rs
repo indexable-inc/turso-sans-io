@@ -600,10 +600,7 @@ pub fn begin_read_page(
         None
     });
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    db_file.read_page(page_idx, io_ctx, c)
+    CompletionGroup::submit(group, c, |c| db_file.read_page(page_idx, io_ctx, c))
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -653,11 +650,10 @@ pub fn begin_write_btree_page(
         })
     };
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
     let io_ctx = pager.io_ctx.read();
-    page_source.write_page(page_id, buffer, &io_ctx, c)
+    CompletionGroup::submit(group, c, |c| {
+        page_source.write_page(page_id, buffer, &io_ctx, c)
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
@@ -2130,10 +2126,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
         PageTransform::None => complete,
     };
     let c = Completion::new_read(buf, complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    io.pread(offset, c)
+    CompletionGroup::submit(group, c, |c| io.pread(offset, c))
 }
 
 pub fn parse_wal_frame_header(frame: &[u8]) -> (WalFrameHeader, &[u8]) {
@@ -2249,11 +2242,7 @@ pub fn begin_write_wal_header<F: File + ?Sized>(
     };
     #[allow(clippy::arc_with_non_send_sync)]
     let c = Completion::new_write(write_complete);
-    if let Some(group) = group {
-        group.add(&c);
-    }
-    let c = io.pwrite(0, buffer, c)?;
-    Ok(c)
+    CompletionGroup::submit(group, c, |c| io.pwrite(0, buffer, c))
 }
 
 /// If the payload overflows the given limits, returns `Some(local_size)`, where `local_size` is

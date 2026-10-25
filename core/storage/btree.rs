@@ -102,6 +102,25 @@ fn first_unfinished(group: Option<&CompletionGroup>) -> Option<Completion> {
     group?.completions().iter().find(|c| !c.finished()).cloned()
 }
 
+/// Test counters for the error exit of `NonRootPickSiblings`. Per thread:
+/// a test's statements run on its own thread.
+#[cfg(test)]
+pub(crate) mod sibling_error_stats {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Errors `NonRootPickSiblings` failed with.
+        pub(crate) static ERRORS: Cell<u64> = const { Cell::new(0) };
+        /// Yields on a sibling read still in flight after such an error.
+        pub(crate) static WAITS: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// (errors, waits) so far on this thread.
+    pub(crate) fn get() -> (u64, u64) {
+        (ERRORS.with(Cell::get), WAITS.with(Cell::get))
+    }
+}
+
 /// The B-Tree page header is 12 bytes for interior pages and 8 bytes for leaf pages.
 ///
 /// +--------+-----------------+-----------------+-----------------+--------+----- ..... ----+
@@ -3677,6 +3696,253 @@ impl BTreeCursor {
     }
 
     /// Balance a non root page by trying to balance cells between a maximum of 3 siblings that should be neighboring the page that overflowed/underflowed.
+    /// `NonRootPickSiblings`: pick the siblings of the page to balance and
+    /// issue their reads into `balance_state.sibling_load_group`. Every
+    /// error here returns through the caller, which first waits out the
+    /// reads already in the group (see `balance_non_root`).
+    fn balance_non_root_pick_siblings(&mut self, usable_space: usize) -> IOResultOr<()> {
+        let BalanceState {
+            sub_state,
+            balance_info,
+            sibling_load_group,
+            ..
+        } = &mut self.balance_state;
+        // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
+        let _ = self.move_to_right_state.1.take();
+
+        let (parent_page_idx, page_type, cell_count, over_cell_count) = {
+            let parent_page = self.stack.top_ref();
+            let parent_contents = parent_page.get_contents();
+            (
+                self.stack.current(),
+                parent_contents.page_type()?,
+                parent_contents.cell_count(),
+                parent_contents.overflow_cells.len(),
+            )
+        };
+
+        turso_assert!(
+            matches!(page_type, PageType::IndexInterior | PageType::TableInterior),
+            "expected index or table interior page"
+        );
+        let number_of_cells_in_parent = cell_count + over_cell_count;
+
+        // If `seek` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
+        // In any other case, `seek` will stay in the correct index.
+        let past_rightmost_pointer =
+            self.stack.current_cell_index() as usize == number_of_cells_in_parent + 1;
+        if past_rightmost_pointer {
+            self.stack.retreat();
+        }
+
+        let parent_page = self.stack.get_page_at_level(parent_page_idx).unwrap();
+        let parent_contents = parent_page.get_contents();
+        if !past_rightmost_pointer && over_cell_count > 0 {
+            // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
+            // This can only happen on index btrees.
+            if matches!(page_type, PageType::IndexInterior) {
+                turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
+            } else {
+                turso_assert!(false, "page type must have no overflow cells", {
+                    "page_type": page_type
+                });
+            }
+            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+            let parent_page_cell_idx = self.stack.current_cell_index() as usize;
+            // Parent page must be positioned at the divider cell that overflowed due to the replacement.
+            turso_assert!(
+                overflow_cell.index == parent_page_cell_idx,
+                "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent unbalanced, and hence parent page's position must equal overflow_cell.index",
+                { "parent_page_id": parent_page.get().id(), "parent_page_cell_idx": parent_page_cell_idx, "overflow_cell_index": overflow_cell.index }
+            );
+        }
+        self.pager.add_dirty(parent_page)?;
+        let parent_contents = parent_page.get_contents();
+        let page_to_balance_idx = self.stack.current_cell_index() as usize;
+
+        tracing::debug!(
+            "balance_non_root(parent_id={} page_to_balance_idx={})",
+            parent_page.get().id(),
+            page_to_balance_idx
+        );
+        // Part 1: Find the sibling pages to balance
+        let mut pages_to_balance: [Option<PinGuard>; MAX_SIBLING_PAGES_TO_BALANCE] =
+            [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
+        turso_assert!(
+            page_to_balance_idx <= parent_contents.cell_count(),
+            "page_to_balance_idx={page_to_balance_idx} is out of bounds for parent cell count {number_of_cells_in_parent}"
+        );
+        // As there will be at maximum 3 pages used to balance:
+        // sibling_pointer is the index represeneting one of those 3 pages, and we initialize it to the last possible page.
+        // next_divider is the first divider that contains the first page of the 3 pages.
+        let (sibling_pointer, first_cell_divider) = match number_of_cells_in_parent {
+            n if n < 2 => (number_of_cells_in_parent, 0),
+            2 => (2, 0),
+            // Here we will have at lest 2 cells and one right pointer, therefore we can get 3 siblings.
+            // In case of 2 we will have all pages to balance.
+            _ => {
+                // In case of > 3 we have to check which ones to get
+                let next_divider = if page_to_balance_idx == 0 {
+                    // first cell, take first 3
+                    0
+                } else if page_to_balance_idx == number_of_cells_in_parent {
+                    // Page corresponds to right pointer, so take last 3
+                    number_of_cells_in_parent - 2
+                } else {
+                    // Some cell in the middle, so we want to take sibling on left and right.
+                    page_to_balance_idx - 1
+                };
+                (2, next_divider)
+            }
+        };
+        let sibling_count = sibling_pointer + 1;
+
+        let last_sibling_is_right_pointer = sibling_pointer + first_cell_divider
+            - parent_contents.overflow_cells.len()
+            == parent_contents.cell_count();
+        // Get the right page pointer that we will need to update later
+        let right_pointer = if last_sibling_is_right_pointer {
+            parent_contents.rightmost_pointer_raw()?.unwrap()
+        } else {
+            let max_overflow_cells = if matches!(page_type, PageType::IndexInterior) {
+                1
+            } else {
+                0
+            };
+            turso_assert!(
+                parent_contents.overflow_cells.len() <= max_overflow_cells,
+                "must have at most {max_overflow_cells} overflow cell in the parent"
+            );
+            // OVERFLOW CELL ADJUSTMENT:
+            // Let there be parent with cells [0,1,2,3,4].
+            // Let's imagine the cell at idx 2 gets replaced with a new payload that causes it to overflow.
+            // See handling of InteriorNodeReplacement in btree.rs.
+            //
+            // In this case the rightmost divider is going to be 3 (2 is the middle one and we pick neighbors 1-3).
+            // drop_cell(): [0,1,2,3,4] -> [0,1,3,4]   <-- cells on right side get shifted left!
+            // insert_into_cell(): [0,1,3,4] -> [0,1,3,4] + overflow cell (2)  <-- crucially, no physical shifting happens, overflow cell is stored separately
+            //
+            // This means '3' is actually physically located at index '2'.
+            // So IF the parent has an overflow cell, we need to subtract 1 to get the actual rightmost divider cell idx to physically read from.
+            // The formula for the actual cell idx is:
+            // first_cell_divider + sibling_pointer - parent_contents.overflow_cells.len()
+            // so in the above case:
+            // actual_cell_idx = 1 + 2 - 1 = 2
+            //
+            // In the case where the last divider cell is the overflow cell, there would be no left-shifting of cells in drop_cell(),
+            // because they are still positioned correctly (imagine .pop() from a vector).
+            // However, note that we are always looking for the _rightmost_ child page pointer between the (max 2) dividers, and for any case where the last divider cell is the overflow cell,
+            // the 'last_sibling_is_right_pointer' condition will also be true (since the overflow cell's left child will be the middle page), so we won't enter this code branch.
+            //
+            // Hence: when we enter this branch with overflow_cells.len() == 1, we know that left-shifting has happened and we need to subtract 1.
+            let actual_cell_idx =
+                first_cell_divider + sibling_pointer - parent_contents.overflow_cells.len();
+            let start_of_cell = parent_contents.cell_get_raw_start_offset(actual_cell_idx);
+            let buf = parent_contents.as_ptr().as_mut_ptr();
+            unsafe { buf.add(start_of_cell) }
+        };
+
+        // load sibling pages
+        // start loading right page first
+        let mut pgno: u32 = unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
+        let current_sibling = sibling_pointer;
+        let group = sibling_load_group.get_or_insert_with(|| CompletionGroup::new(|_| {}));
+        for i in (0..=current_sibling).rev() {
+            match self.pager.read_page_into(pgno as i64, Some(group)) {
+                Err(e) => {
+                    mark_unlikely();
+                    tracing::error!("error reading page {}: {}", pgno, e);
+                    // The caller waits out the reads already in
+                    // the group, then fails with `e`.
+                    return Err(e);
+                }
+                Ok(IOResult::Done((page, _))) => {
+                    pages_to_balance[i].replace(PinGuard::new(page));
+                }
+                Ok(IOResult::IO(IOCompletions(spill_c))) => {
+                    // Spill yield. The loop is fully re-entrant:
+                    // on re-entry we re-execute from the top of
+                    // `NonRootPickSiblings`, the pager's
+                    // `pending_reads` returns the same PageRef
+                    // for the in-flight sibling (its read is
+                    // already in the group), and cache hits for
+                    // previously-loaded siblings need no read.
+                    io_yield_one!(spill_c);
+                }
+            }
+            if i == 0 {
+                break;
+            }
+            let next_cell_divider = i + first_cell_divider - 1;
+            let divider_is_overflow_cell = parent_contents
+                .overflow_cells
+                .first()
+                .is_some_and(|overflow_cell| overflow_cell.index == next_cell_divider);
+            if divider_is_overflow_cell {
+                turso_assert!(
+                    matches!(
+                        parent_contents.page_type().ok(),
+                        Some(PageType::IndexInterior)
+                    ),
+                    "expected index interior page",
+                    { "page_type": parent_contents.page_type().ok() }
+                );
+                turso_assert!(
+                    parent_contents.overflow_cells.len() == 1,
+                    "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
+                );
+                let overflow_cell = parent_contents.overflow_cells.first().unwrap();
+                pgno = u32::from_be_bytes(overflow_cell.payload[0..4].try_into().unwrap());
+            } else {
+                // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
+                // here we only subtract 1 if the divider cell has been shifted left, i.e. the overflow cell was placed to the left
+                // this cell.
+                let actual_cell_idx =
+                    if let Some(overflow_cell) = parent_contents.overflow_cells.first() {
+                        if next_cell_divider < overflow_cell.index {
+                            next_cell_divider
+                        } else {
+                            next_cell_divider - 1
+                        }
+                    } else {
+                        next_cell_divider
+                    };
+                pgno = match parent_contents.cell_get(actual_cell_idx, usable_space)? {
+                    BTreeCell::TableInteriorCell(TableInteriorCell {
+                        left_child_page, ..
+                    })
+                    | BTreeCell::IndexInteriorCell(IndexInteriorCell {
+                        left_child_page, ..
+                    }) => left_child_page,
+                    other => {
+                        mark_unlikely();
+                        crate::bail_corrupt_error!("expected interior cell, got {:?}", other)
+                    }
+                };
+            }
+        }
+
+        balance_info.replace(BalanceInfo {
+            pages_to_balance,
+            rightmost_pointer: right_pointer,
+            sibling_count,
+            first_divider_cell: first_cell_divider,
+            reusable_divider_cell: crate::alloc::vec![],
+        });
+        *sub_state = BalanceSubState::NonRootDoBalancing;
+        // Wait for the sibling reads issued across (possibly
+        // multiple) entries into this state. Take the group so
+        // the next balance starts fresh.
+        let completion = sibling_load_group
+            .take()
+            .expect("the sibling loop above created the group")
+            .build();
+        if !completion.finished() {
+            io_yield_one!(completion);
+        }
+        Ok(IOResult::Done(()))
+    }
+
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance_non_root(&mut self) -> IOResultOr<()> {
         loop {
@@ -3686,8 +3952,7 @@ impl BTreeCursor {
                 balance_info,
                 reusable_divider_buffers,
                 reusable_cell_payloads,
-                sibling_load_group,
-                sibling_load_error,
+                ..
             } = &mut self.balance_state;
             tracing::debug!(?sub_state);
 
@@ -3699,267 +3964,39 @@ impl BTreeCursor {
                     panic!("balance_non_root: unexpected state {sub_state:?}")
                 }
                 BalanceSubState::NonRootPickSiblings => {
-                    if sibling_load_error.is_some() {
-                        // A sibling read failed: wait out the reads issued
-                        // before it, then fail with its error.
-                        if let Some(c) = first_unfinished(sibling_load_group.as_ref()) {
-                            io_yield_one!(c);
-                        }
-                        *sibling_load_group = None;
-                        return Err(sibling_load_error.take().expect("checked above"));
-                    }
-                    // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
-                    let _ = self.move_to_right_state.1.take();
-
-                    let (parent_page_idx, page_type, cell_count, over_cell_count) = {
-                        let parent_page = self.stack.top_ref();
-                        let parent_contents = parent_page.get_contents();
-                        (
-                            self.stack.current(),
-                            parent_contents.page_type()?,
-                            parent_contents.cell_count(),
-                            parent_contents.overflow_cells.len(),
-                        )
-                    };
-
-                    turso_assert!(
-                        matches!(page_type, PageType::IndexInterior | PageType::TableInterior),
-                        "expected index or table interior page"
-                    );
-                    let number_of_cells_in_parent = cell_count + over_cell_count;
-
-                    // If `seek` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
-                    // In any other case, `seek` will stay in the correct index.
-                    let past_rightmost_pointer =
-                        self.stack.current_cell_index() as usize == number_of_cells_in_parent + 1;
-                    if past_rightmost_pointer {
-                        self.stack.retreat();
-                    }
-
-                    let parent_page = self.stack.get_page_at_level(parent_page_idx).unwrap();
-                    let parent_contents = parent_page.get_contents();
-                    if !past_rightmost_pointer && over_cell_count > 0 {
-                        // The ONLY way we can have an overflow cell in the parent is if we replaced an interior cell from a cell in the child, and that replacement did not fit.
-                        // This can only happen on index btrees.
-                        if matches!(page_type, PageType::IndexInterior) {
-                            turso_assert!(parent_contents.overflow_cells.len() == 1, "index interior page must have no more than 1 overflow cell, as a result of InteriorNodeReplacement");
-                        } else {
-                            turso_assert!(false, "page type must have no overflow cells", {
-                                "page_type": page_type
-                            });
-                        }
-                        let overflow_cell = parent_contents.overflow_cells.first().unwrap();
-                        let parent_page_cell_idx = self.stack.current_cell_index() as usize;
-                        // Parent page must be positioned at the divider cell that overflowed due to the replacement.
-                        turso_assert!(
-                            overflow_cell.index == parent_page_cell_idx,
-                            "overflow cell index must be the result of InteriorNodeReplacement that leaves both child and parent unbalanced, and hence parent page's position must equal overflow_cell.index",
-                            { "parent_page_id": parent_page.get().id(), "parent_page_cell_idx": parent_page_cell_idx, "overflow_cell_index": overflow_cell.index }
-                        );
-                    }
-                    self.pager.add_dirty(parent_page)?;
-                    let parent_contents = parent_page.get_contents();
-                    let page_to_balance_idx = self.stack.current_cell_index() as usize;
-
-                    tracing::debug!(
-                        "balance_non_root(parent_id={} page_to_balance_idx={})",
-                        parent_page.get().id(),
-                        page_to_balance_idx
-                    );
-                    // Part 1: Find the sibling pages to balance
-                    let mut pages_to_balance: [Option<PinGuard>; MAX_SIBLING_PAGES_TO_BALANCE] =
-                        [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
-                    turso_assert!(
-                        page_to_balance_idx <= parent_contents.cell_count(),
-                        "page_to_balance_idx={page_to_balance_idx} is out of bounds for parent cell count {number_of_cells_in_parent}"
-                    );
-                    // As there will be at maximum 3 pages used to balance:
-                    // sibling_pointer is the index represeneting one of those 3 pages, and we initialize it to the last possible page.
-                    // next_divider is the first divider that contains the first page of the 3 pages.
-                    let (sibling_pointer, first_cell_divider) = match number_of_cells_in_parent {
-                        n if n < 2 => (number_of_cells_in_parent, 0),
-                        2 => (2, 0),
-                        // Here we will have at lest 2 cells and one right pointer, therefore we can get 3 siblings.
-                        // In case of 2 we will have all pages to balance.
-                        _ => {
-                            // In case of > 3 we have to check which ones to get
-                            let next_divider = if page_to_balance_idx == 0 {
-                                // first cell, take first 3
-                                0
-                            } else if page_to_balance_idx == number_of_cells_in_parent {
-                                // Page corresponds to right pointer, so take last 3
-                                number_of_cells_in_parent - 2
-                            } else {
-                                // Some cell in the middle, so we want to take sibling on left and right.
-                                page_to_balance_idx - 1
-                            };
-                            (2, next_divider)
-                        }
-                    };
-                    let sibling_count = sibling_pointer + 1;
-
-                    let last_sibling_is_right_pointer = sibling_pointer + first_cell_divider
-                        - parent_contents.overflow_cells.len()
-                        == parent_contents.cell_count();
-                    // Get the right page pointer that we will need to update later
-                    let right_pointer = if last_sibling_is_right_pointer {
-                        parent_contents.rightmost_pointer_raw()?.unwrap()
-                    } else {
-                        let max_overflow_cells = if matches!(page_type, PageType::IndexInterior) {
-                            1
-                        } else {
-                            0
-                        };
-                        turso_assert!(
-                            parent_contents.overflow_cells.len() <= max_overflow_cells,
-                            "must have at most {max_overflow_cells} overflow cell in the parent"
-                        );
-                        // OVERFLOW CELL ADJUSTMENT:
-                        // Let there be parent with cells [0,1,2,3,4].
-                        // Let's imagine the cell at idx 2 gets replaced with a new payload that causes it to overflow.
-                        // See handling of InteriorNodeReplacement in btree.rs.
-                        //
-                        // In this case the rightmost divider is going to be 3 (2 is the middle one and we pick neighbors 1-3).
-                        // drop_cell(): [0,1,2,3,4] -> [0,1,3,4]   <-- cells on right side get shifted left!
-                        // insert_into_cell(): [0,1,3,4] -> [0,1,3,4] + overflow cell (2)  <-- crucially, no physical shifting happens, overflow cell is stored separately
-                        //
-                        // This means '3' is actually physically located at index '2'.
-                        // So IF the parent has an overflow cell, we need to subtract 1 to get the actual rightmost divider cell idx to physically read from.
-                        // The formula for the actual cell idx is:
-                        // first_cell_divider + sibling_pointer - parent_contents.overflow_cells.len()
-                        // so in the above case:
-                        // actual_cell_idx = 1 + 2 - 1 = 2
-                        //
-                        // In the case where the last divider cell is the overflow cell, there would be no left-shifting of cells in drop_cell(),
-                        // because they are still positioned correctly (imagine .pop() from a vector).
-                        // However, note that we are always looking for the _rightmost_ child page pointer between the (max 2) dividers, and for any case where the last divider cell is the overflow cell,
-                        // the 'last_sibling_is_right_pointer' condition will also be true (since the overflow cell's left child will be the middle page), so we won't enter this code branch.
-                        //
-                        // Hence: when we enter this branch with overflow_cells.len() == 1, we know that left-shifting has happened and we need to subtract 1.
-                        let actual_cell_idx = first_cell_divider + sibling_pointer
-                            - parent_contents.overflow_cells.len();
-                        let start_of_cell =
-                            parent_contents.cell_get_raw_start_offset(actual_cell_idx);
-                        let buf = parent_contents.as_ptr().as_mut_ptr();
-                        unsafe { buf.add(start_of_cell) }
-                    };
-
-                    // load sibling pages
-                    // start loading right page first
-                    let mut pgno: u32 =
-                        unsafe { right_pointer.cast::<u32>().read_unaligned().swap_bytes() };
-                    let current_sibling = sibling_pointer;
-                    let group =
-                        sibling_load_group.get_or_insert_with(|| CompletionGroup::new(|_| {}));
-                    for i in (0..=current_sibling).rev() {
-                        match self.pager.read_page_into(pgno as i64, Some(group)) {
+                    if self.balance_state.sibling_load_error.is_none() {
+                        match self.balance_non_root_pick_siblings(usable_space) {
+                            Ok(IOResult::Done(())) => continue,
+                            Ok(io) => return Ok(io),
                             Err(e) => {
                                 mark_unlikely();
-                                tracing::error!("error reading page {}: {}", pgno, e);
-                                // Reads from earlier iterations / yields may
-                                // still be in flight. Wait for them by
-                                // yielding (re-entry returns `e` once they
-                                // are done), never by blocking in the IO
-                                // loop: a sans-io backend refuses that, and
-                                // its refusal would replace `e`.
-                                if let Some(c) = first_unfinished(Some(group)) {
-                                    *sibling_load_error = Some(e);
-                                    io_yield_one!(c);
-                                }
-                                *sibling_load_group = None;
-                                return Err(e);
+                                #[cfg(test)]
+                                sibling_error_stats::ERRORS.with(|n| n.set(n.get() + 1));
+                                self.balance_state.sibling_load_error = Some(e);
                             }
-                            Ok(IOResult::Done((page, _))) => {
-                                pages_to_balance[i].replace(PinGuard::new(page));
-                            }
-                            Ok(IOResult::IO(IOCompletions(spill_c))) => {
-                                // Spill yield. The loop is fully re-entrant:
-                                // on re-entry we re-execute from the top of
-                                // `NonRootPickSiblings`, the pager's
-                                // `pending_reads` returns the same PageRef
-                                // for the in-flight sibling (its read is
-                                // already in the group), and cache hits for
-                                // previously-loaded siblings need no read.
-                                io_yield_one!(spill_c);
-                            }
-                        }
-                        if i == 0 {
-                            break;
-                        }
-                        let next_cell_divider = i + first_cell_divider - 1;
-                        let divider_is_overflow_cell = parent_contents
-                            .overflow_cells
-                            .first()
-                            .is_some_and(|overflow_cell| overflow_cell.index == next_cell_divider);
-                        if divider_is_overflow_cell {
-                            turso_assert!(
-                                matches!(
-                                    parent_contents.page_type().ok(),
-                                    Some(PageType::IndexInterior)
-                                ),
-                                "expected index interior page",
-                                { "page_type": parent_contents.page_type().ok() }
-                            );
-                            turso_assert!(
-                                parent_contents.overflow_cells.len() == 1,
-                                "must have a single overflow cell in the parent, as a result of InteriorNodeReplacement"
-                            );
-                            let overflow_cell = parent_contents.overflow_cells.first().unwrap();
-                            pgno =
-                                u32::from_be_bytes(overflow_cell.payload[0..4].try_into().unwrap());
-                        } else {
-                            // grep for 'OVERFLOW CELL ADJUSTMENT' for explanation.
-                            // here we only subtract 1 if the divider cell has been shifted left, i.e. the overflow cell was placed to the left
-                            // this cell.
-                            let actual_cell_idx = if let Some(overflow_cell) =
-                                parent_contents.overflow_cells.first()
-                            {
-                                if next_cell_divider < overflow_cell.index {
-                                    next_cell_divider
-                                } else {
-                                    next_cell_divider - 1
-                                }
-                            } else {
-                                next_cell_divider
-                            };
-                            pgno = match parent_contents.cell_get(actual_cell_idx, usable_space)? {
-                                BTreeCell::TableInteriorCell(TableInteriorCell {
-                                    left_child_page,
-                                    ..
-                                })
-                                | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                    left_child_page,
-                                    ..
-                                }) => left_child_page,
-                                other => {
-                                    mark_unlikely();
-                                    crate::bail_corrupt_error!(
-                                        "expected interior cell, got {:?}",
-                                        other
-                                    )
-                                }
-                            };
                         }
                     }
-
-                    balance_info.replace(BalanceInfo {
-                        pages_to_balance,
-                        rightmost_pointer: right_pointer,
-                        sibling_count,
-                        first_divider_cell: first_cell_divider,
-                        reusable_divider_cell: crate::alloc::vec![],
-                    });
-                    *sub_state = BalanceSubState::NonRootDoBalancing;
-                    // Wait for the sibling reads issued across (possibly
-                    // multiple) entries into this state. Take the group so
-                    // the next balance starts fresh.
-                    let completion = sibling_load_group
+                    // A step of this state failed: a sibling read, a parent
+                    // cell, `add_dirty` on the parent (also on a re-entry
+                    // after a spill yield). Sibling reads issued before it
+                    // (this entry or an earlier one) may still be in flight
+                    // and must finish before their pages are dropped. Wait
+                    // for them by yielding (the re-entry lands here again),
+                    // never by blocking in the IO loop: a sans-io backend
+                    // refuses that, and its refusal would replace the error.
+                    // The group holds only reads that were submitted (see
+                    // `CompletionGroup::submit`), so each one does finish.
+                    let state = &mut self.balance_state;
+                    if let Some(c) = first_unfinished(state.sibling_load_group.as_ref()) {
+                        #[cfg(test)]
+                        sibling_error_stats::WAITS.with(|n| n.set(n.get() + 1));
+                        io_yield_one!(c);
+                    }
+                    state.sibling_load_group = None;
+                    return Err(state
+                        .sibling_load_error
                         .take()
-                        .expect("the sibling loop above created the group")
-                        .build();
-                    if !completion.finished() {
-                        io_yield_one!(completion);
-                    }
+                        .expect("an error was stored above"));
                 }
                 BalanceSubState::NonRootDoBalancing => {
                     // Ensure all involved pages are in memory.
@@ -16113,5 +16150,193 @@ mod tests {
             run_until_done(|| cursor.next(), pager.deref()).unwrap();
         }
         assert_eq!(rowids, (1..=65).collect::<Vec<i64>>());
+    }
+
+    /// A `File` that refuses chosen reads at submit time (`pread` returns
+    /// `Err` without completing), as a backend does when it cannot queue a
+    /// read; `MemoryIO` underneath.
+    mod submit_fault {
+        use crate::io::{
+            Buffer, Clock, Completion, File, FileId, FileSyncType, MemoryIO, OpenFlags, IO,
+        };
+        use crate::sync::Mutex;
+        use crate::{LimboError, MonotonicInstant, Result, WallClockInstant};
+        use std::collections::HashSet;
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::Arc;
+
+        /// While `armed`, every read of `path` at an offset not read before
+        /// arming is refused.
+        #[derive(Default)]
+        pub(super) struct Fault {
+            pub(super) armed: AtomicBool,
+            pub(super) seen: Mutex<HashSet<u64>>,
+            pub(super) refused: AtomicU64,
+        }
+
+        pub(super) struct FaultIO {
+            pub(super) inner: MemoryIO,
+            pub(super) path: String,
+            pub(super) fault: Arc<Fault>,
+        }
+
+        struct FaultFile {
+            inner: Arc<dyn File>,
+            fault: Arc<Fault>,
+        }
+
+        impl Clock for FaultIO {
+            fn current_time_monotonic(&self) -> MonotonicInstant {
+                self.inner.current_time_monotonic()
+            }
+            fn current_time_wall_clock(&self) -> WallClockInstant {
+                self.inner.current_time_wall_clock()
+            }
+        }
+
+        impl IO for FaultIO {
+            fn open_file(
+                &self,
+                path: &str,
+                flags: OpenFlags,
+                direct: bool,
+            ) -> Result<Arc<dyn File>> {
+                let f = self.inner.open_file(path, flags, direct)?;
+                if path != self.path {
+                    return Ok(f);
+                }
+                Ok(Arc::new(FaultFile {
+                    inner: f,
+                    fault: self.fault.clone(),
+                }))
+            }
+            fn remove_file(&self, path: &str) -> Result<()> {
+                self.inner.remove_file(path)
+            }
+            fn file_id(&self, path: &str) -> Result<FileId> {
+                self.inner.file_id(path)
+            }
+            fn step(&self) -> Result<()> {
+                self.inner.step()
+            }
+        }
+
+        impl File for FaultFile {
+            fn lock_file(&self, exclusive: bool) -> Result<()> {
+                self.inner.lock_file(exclusive)
+            }
+            fn unlock_file(&self) -> Result<()> {
+                self.inner.unlock_file()
+            }
+            fn pread(&self, pos: u64, c: Completion) -> Result<Completion> {
+                if self.fault.armed.load(Ordering::SeqCst) {
+                    if !self.fault.seen.lock().contains(&pos) {
+                        self.fault.refused.fetch_add(1, Ordering::SeqCst);
+                        return Err(LimboError::InternalError(
+                            "injected read submit failure".into(),
+                        ));
+                    }
+                } else {
+                    self.fault.seen.lock().insert(pos);
+                }
+                self.inner.pread(pos, c)
+            }
+            fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+                self.inner.pwrite(pos, buffer, c)
+            }
+            fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
+                self.inner.sync(c, sync_type)
+            }
+            fn size(&self) -> Result<u64> {
+                self.inner.size()
+            }
+            fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
+                self.inner.truncate(len, c)
+            }
+        }
+    }
+
+    /// Review C1 of 0d9b26ae6: a sibling read in `NonRootPickSiblings`
+    /// whose submit fails (the backend's `pread` returns `Err`) used to stay
+    /// in the sibling group, unfinished for ever, because the read was added
+    /// to the group before it was submitted. The error path then yielded on
+    /// it and the DELETE never finished. Now a refused submit is unlinked
+    /// from its group, and the DELETE fails with the read's own error.
+    #[test]
+    fn balance_sibling_read_submit_failure_returns_its_error() {
+        use submit_fault::{Fault, FaultIO};
+        const PATH: &str = "sibling-submit-fault.db";
+        let fault = Arc::new(Fault::default());
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io: Arc<dyn IO> = Arc::new(FaultIO {
+            inner: MemoryIO::new(),
+            path: PATH.into(),
+            fault: fault.clone(),
+        });
+        {
+            let db = Database::open_file(io.clone(), PATH, Arc::new(SqliteDialect)).unwrap();
+            let conn = db.connect(ConnectOpts::new()).unwrap();
+            conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+                .unwrap();
+            // About four rows per leaf: 15 leaves under an interior root.
+            conn.execute(
+                "INSERT INTO t WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 60) \
+                 SELECT i, zeroblob(900) FROM c",
+            )
+            .unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+        // Reopen with a cold cache: every page read now goes to the file.
+        fault.seen.lock().clear();
+        let db = Database::open_file(io.clone(), PATH, Arc::new(SqliteDialect)).unwrap();
+        let conn = db.connect(ConnectOpts::new()).unwrap();
+        // Read the pages the DELETE's seek needs; the leaf's siblings stay
+        // unread, so the rebalance is what reads them.
+        assert_eq!(
+            query_single_i64(&conn, "SELECT count(*) FROM t WHERE id BETWEEN 30 AND 33"),
+            4
+        );
+        fault.armed.store(true, Ordering::SeqCst);
+        let (errors_before, _) = sibling_error_stats::get();
+        let mut stmt = conn
+            .prepare("DELETE FROM t WHERE id BETWEEN 30 AND 33")
+            .unwrap();
+        let mut outcome = None;
+        for _ in 0..10_000 {
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    outcome = Some(Ok(()));
+                    break;
+                }
+                Ok(StepResult::IO | StepResult::Yield) => io.step().unwrap(),
+                Ok(other) => panic!("unexpected step result {other:?}"),
+                Err(e) => {
+                    outcome = Some(Err(e));
+                    break;
+                }
+            }
+        }
+        fault.armed.store(false, Ordering::SeqCst);
+        let Some(outcome) = outcome else {
+            // Dropping the statement would reset it, and the reset waits
+            // (blocking) on the same read: it would hang, not fail.
+            std::mem::forget(stmt);
+            panic!("DELETE made no progress in 10000 steps: it waits on a read that was never submitted");
+        };
+        drop(stmt);
+        let err = outcome.expect_err("the rebalance's sibling read was refused");
+        assert!(
+            err.to_string().contains("injected read submit failure"),
+            "DELETE failed with {err}, not the refused read's error"
+        );
+        assert!(fault.refused.load(Ordering::SeqCst) > 0);
+        assert!(
+            sibling_error_stats::get().0 > errors_before,
+            "the refused read was not a sibling read of NonRootPickSiblings"
+        );
+        // The failed statement rolled back and left the tree whole.
+        assert_eq!(query_single_i64(&conn, "SELECT count(*) FROM t"), 60);
+        assert_eq!(query_single_text(&conn, "PRAGMA integrity_check"), "ok");
     }
 }

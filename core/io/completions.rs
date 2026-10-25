@@ -188,6 +188,43 @@ impl CompletionGroup {
         );
     }
 
+    /// Submit `c` as a child of `group` (when given): link it, run
+    /// `submit`, and unlink it again when the submit fails without having
+    /// finished it. A refused submit never completes `c`, so leaving it
+    /// linked would hold the group open for ever, and an error path that
+    /// waits on the group's unfinished children would wait on it for ever.
+    /// So the group only ever holds children that were submitted (or that
+    /// finished).
+    pub fn submit(
+        group: Option<&mut Self>,
+        c: Completion,
+        submit: impl FnOnce(Completion) -> crate::Result<Completion>,
+    ) -> crate::Result<Completion> {
+        let Some(group) = group else {
+            return submit(c);
+        };
+        group.add(&c);
+        let r = submit(c.clone());
+        if r.is_err() && !c.finished() {
+            group.unlink(&c);
+        }
+        r
+    }
+
+    /// Undo `add` for a child that was never submitted.
+    fn unlink(&mut self, c: &Completion) {
+        let inner = c.get_inner();
+        let idx = self
+            .completions
+            .iter()
+            .rposition(|x| x.inner.as_ref().is_some_and(|x| Arc::ptr_eq(x, inner)))
+            .expect("unlink: completion is not in the group");
+        let _unlinked = self.completions.remove(idx);
+        *inner.parent.lock() = None;
+        let prev = self.inner.outstanding.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(prev > 1, "unlink: group counted below its builder token");
+    }
+
     /// The children added so far. Used by error paths that need to
     /// wait on the kernel side via `IO::drain_completions` after
     /// cancelling the group.

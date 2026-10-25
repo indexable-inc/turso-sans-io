@@ -3933,11 +3933,8 @@ impl Wal for WalFile {
         });
 
         let c = Completion::new_read(raw_buf, complete);
-        if let Some(group) = group {
-            group.add(&c);
-        }
         let file = self.coordination.wal_file()?;
-        file.pread(offset, c)
+        CompletionGroup::submit(group, c, |c| file.pread(offset, c))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
