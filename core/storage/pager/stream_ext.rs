@@ -1462,9 +1462,25 @@ impl Pager {
 
     /// Test hook: what "another statement in the run took the slots" looks
     /// like: evict every evictable page except `keep`, then lend every free
-    /// slot until the run ends. Returns the slots taken.
+    /// slot no claim holds until the run ends. Returns the slots taken.
+    /// Claimed slots stay free: a real statement takes a slot only past
+    /// every claim (`stream_ensure_slots`), so taking them would break the
+    /// reserve-before-mutate promise in a way no statement can.
     #[cfg(test)]
     pub(crate) fn stream_test_squeeze(&self, keep: Option<usize>) -> u32 {
+        self.stream_test_squeeze_inner(keep, false)
+    }
+
+    /// Test hook: [`Self::stream_test_squeeze`] that takes claimed slots
+    /// too: a claim lost under a statement, for the re-checks that guard
+    /// against it (F5).
+    #[cfg(test)]
+    pub(crate) fn stream_test_squeeze_claimed(&self, keep: Option<usize>) -> u32 {
+        self.stream_test_squeeze_inner(keep, true)
+    }
+
+    #[cfg(test)]
+    fn stream_test_squeeze_inner(&self, keep: Option<usize>, claimed_too: bool) -> u32 {
         {
             let kept =
                 keep.and_then(|id| self.page_cache.write().peek(&PageCacheKey::new(id), false));
@@ -1480,8 +1496,16 @@ impl Pager {
             }
         }
         let db = self.sp().db.clone();
+        let claimed = if claimed_too {
+            0
+        } else {
+            db.claim_slots(self.stream_key()).1
+        };
         let mut n = 0;
-        while let Some(b) = db.pool().try_get_page() {
+        while db.pool().page_slots().1 > claimed {
+            let Some(b) = db.pool().try_get_page() else {
+                break;
+            };
             db.keep(Arc::new(b));
             n += 1;
         }

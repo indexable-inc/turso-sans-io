@@ -539,7 +539,8 @@ fn drop_table_in_txn_small_arena_parks() {
 /// F5: `free_page` reserves at `Start`, then `AddToTrunk` reads the
 /// (uncached) trunk and yields; meanwhile the slots go to another
 /// statement. The re-check after the read parks (state unchanged, no new
-/// read), and the next run finishes the free.
+/// read), and the next run finishes the free. To force the re-check, the
+/// squeeze here also takes claimed slots, which no real statement can.
 #[test]
 fn free_page_first_trunk_uncached_one_slot_parks() {
     // R for a 25-page database is 27 slots: 64 leaves room for cursors.
@@ -593,8 +594,8 @@ fn free_page_first_trunk_uncached_one_slot_parks() {
                 // The trunk read finished: give the slots away now. The
                 // arena is shared, so empty the other connection's cache
                 // too (a reserve evicts from it).
-                pager1.stream_test_squeeze(None);
-                pager.stream_test_squeeze(Some(trunk_id));
+                pager1.stream_test_squeeze_claimed(None);
+                pager.stream_test_squeeze_claimed(Some(trunk_id));
                 squeezed = true;
             }
             let r = pager.free_page(None, free_id);
