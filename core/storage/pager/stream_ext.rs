@@ -76,10 +76,13 @@ struct StreamPagerState {
     /// running: no nested statement may step inside it (see
     /// [`Pager::stream_swap_owner`]).
     in_mutation: bool,
-    /// The store transaction this connection opened (by staging into it):
-    /// only it may discard, abort or commit that transaction. The shared
-    /// `StreamDb` holds one open transaction, the writer's; a reader's
-    /// rollback or doom must never touch it.
+    /// The store transaction this connection last staged into. Ownership
+    /// of the open transaction is the write lock (`stream_owns_txn`: only
+    /// the writer opens one, and `begin_write_tx` aborts any a gone writer
+    /// left), so a reader's rollback or doom never touches it. This is
+    /// only checked at commit: if the open transaction is not the one we
+    /// staged into (ours was aborted under us and a new one opened), the
+    /// commit would land a partial transaction, so it dooms instead.
     txn: Option<u32>,
     /// Credit parks in a row (a run's credits short of what a run with the
     /// largest grant seen would have) since the last reserve that finished.
@@ -851,6 +854,7 @@ impl Pager {
             }
         }
         r.inflight.retain(|c| !c.finished());
+        let issued_before = r.next;
         while r.next < r.todo.len() && r.inflight.len() < MAX_READ_PAGES {
             if db.free_credits() < 1 {
                 break;
@@ -889,6 +893,16 @@ impl Pager {
         // in, and a restore read's failure must reach this gate (it dooms
         // the transaction), not end just the statement.
         if r.next < r.todo.len() || r.inflight.iter().any(|c| !c.finished()) {
+            if r.next == issued_before && r.inflight.is_empty() {
+                // Nothing went out and nothing is in flight: the run's
+                // credits were short. A counted park (the restore limit,
+                // `restoring` is set): past it the gate dooms the
+                // transaction rather than wait forever.
+                return self.stream_credit_park();
+            }
+            if r.next > issued_before {
+                self.stream_credit_parks_reset();
+            }
             io_yield_one!(db.park());
         }
         for c in &r.inflight {

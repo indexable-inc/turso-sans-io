@@ -2531,7 +2531,13 @@ impl Program {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
         if let Some(prev) = stream_prev {
-            let mid_op = matches!(result, ProgramStep::IO | ProgramStep::Yield);
+            // A stream BUSY (a read whose credits never came) retries at
+            // the same PC, possibly mid-opcode: it keeps its claim like IO.
+            // The claim ends with the statement (reset, drop).
+            let mid_op = matches!(
+                result,
+                ProgramStep::IO | ProgramStep::Yield | ProgramStep::Busy
+            );
             pager.stream_step_end(state.stream_owner, prev, mid_op);
         }
         match &result {

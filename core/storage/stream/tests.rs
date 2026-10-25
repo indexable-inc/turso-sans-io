@@ -1965,3 +1965,505 @@ fn rv_losing_writer_rollback_keeps_winner2() {
     assert_eq!(h.one("SELECT count(*) FROM t"), 40 + 1201);
     h.integrity();
 }
+
+// ---- final review, round 4 (reviewer repros) -------------------------------
+
+/// Step `stmt` for at most `runs` runs, collecting column `col` of each row.
+/// Returns (done, rows, other step result if any).
+fn r4_step_rows(
+    h: &mut H,
+    stmt: &mut crate::Statement,
+    runs: u64,
+    max_rows: usize,
+) -> (bool, Vec<i64>, Option<String>) {
+    let mut out = Vec::new();
+    for _ in 0..runs {
+        let r = h.r.run(|| -> crate::Result<Option<Option<String>>> {
+            loop {
+                match stmt.step()? {
+                    StepResult::Row => {
+                        let row = stmt.row().expect("row");
+                        let v: Vec<Value> = row.get_values().cloned().collect();
+                        out.push(int(&v[1]));
+                        if out.len() >= max_rows {
+                            return Ok(None);
+                        }
+                    }
+                    StepResult::Done => return Ok(Some(None)),
+                    StepResult::IO | StepResult::Yield => return Ok(None),
+                    o => return Ok(Some(Some(format!("{o:?}")))),
+                }
+            }
+        });
+        match r {
+            Ok(None) => {
+                if out.len() >= max_rows {
+                    return (false, out, None);
+                }
+            }
+            Ok(Some(None)) => return (true, out, None),
+            Ok(Some(Some(o))) => return (false, out, Some(o)),
+            Err(e) => return (false, out, Some(format!("error {e}"))),
+        }
+    }
+    (false, out, None)
+}
+
+/// D1: a read statement keeps stepping after its connection's read
+/// transaction ended (a sibling autocommit write on the same connection
+/// committed). Its misses then read at Latest and see another
+/// connection's staged, uncommitted (later rolled back) pages.
+#[test]
+fn r4_sibling_reader_after_own_commit_sees_uncommitted() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("CREATE TABLE u(x)");
+    let c = h.conn.clone();
+    let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+    let (done, first, other) = r4_step_rows(&mut h, &mut s, 1000, 4);
+    assert!(!done && other.is_none(), "{other:?}");
+    // Sibling autocommit write on the same connection: commits and ends
+    // the connection's read transaction while `s` is still mid-scan.
+    h.ok("INSERT INTO u VALUES (1)");
+    let w = c.pager.load().holds_read_lock();
+    eprintln!("r4 D1: conn holds read lock after sibling commit: {w}");
+    // Another connection writes every row and spills.
+    let d = h.connect();
+    h.exec_on(&d, "BEGIN", &[]).unwrap();
+    h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+    eprintln!("r4 D1: spilled {}", h.stats().spilled_pages);
+    let (_, rest, other) = r4_step_rows(&mut h, &mut s, 100_000, usize::MAX);
+    drop(s);
+    let sevens = rest.iter().filter(|&&n| n == 7).count();
+    eprintln!(
+        "r4 D1: first {} rows, rest {} rows, {} rows with n=7 (uncommitted), other {:?}",
+        first.len(),
+        rest.len(),
+        sevens,
+        other
+    );
+    h.exec_on(&d, "ROLLBACK", &[]).unwrap();
+    // The connection's cache after the other writer rolled back.
+    let after = h.one("SELECT sum(n) FROM t");
+    eprintln!("r4 D1: after rollback, conn sees sum(n) = {after}");
+    let fresh = h.connect();
+    let rows = h.exec_on(&fresh, "SELECT sum(n) FROM t", &[]).unwrap();
+    eprintln!("r4 D1: fresh conn sees sum(n) = {}", int(&rows[0][0]));
+    assert_eq!(sevens, 0, "a reader saw another connection's uncommitted rows");
+    assert_eq!(after, 0, "the connection's cache kept rolled-back pages");
+}
+
+/// D1b: the same through BEGIN; SELECT (partly); COMMIT.
+#[test]
+fn r4_reader_after_explicit_commit_sees_uncommitted() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let c = h.conn.clone();
+    h.ok("BEGIN");
+    let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+    let (done, _, other) = r4_step_rows(&mut h, &mut s, 1000, 4);
+    assert!(!done && other.is_none(), "{other:?}");
+    let commit = h.exec("COMMIT");
+    eprintln!("r4 D1b: COMMIT with a reader mid-scan: {:?}", commit.as_ref().map(|_| ()));
+    let d = h.connect();
+    h.exec_on(&d, "BEGIN", &[]).unwrap();
+    h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+    let (_, rest, other) = r4_step_rows(&mut h, &mut s, 100_000, usize::MAX);
+    drop(s);
+    let sevens = rest.iter().filter(|&&n| n == 7).count();
+    eprintln!("r4 D1b: rest {} rows, {} with n=7, other {:?}", rest.len(), sevens, other);
+    h.exec_on(&d, "ROLLBACK", &[]).unwrap();
+    let after = h.one("SELECT sum(n) FROM t");
+    eprintln!("r4 D1b: after rollback conn sees sum(n) = {after}");
+    assert_eq!(sevens, 0, "a reader saw another connection's uncommitted rows");
+    assert_eq!(after, 0, "the connection's cache kept rolled-back pages");
+}
+
+/// D1c: the contaminated cache is then written on: C commits a change on
+/// top of pages it read from D's rolled-back transaction.
+#[test]
+fn r4_contaminated_cache_then_commit() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("CREATE TABLE u(x)");
+    let c = h.conn.clone();
+    let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+    let _ = r4_step_rows(&mut h, &mut s, 1000, 4);
+    h.ok("INSERT INTO u VALUES (1)");
+    let d = h.connect();
+    h.exec_on(&d, "BEGIN", &[]).unwrap();
+    h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+    let _ = r4_step_rows(&mut h, &mut s, 100_000, usize::MAX);
+    drop(s);
+    h.exec_on(&d, "ROLLBACK", &[]).unwrap();
+    drop(d);
+    h.ok("UPDATE t SET v = zeroblob(901) WHERE id % 4 = 0");
+    let fresh = h.connect();
+    let rows = h.exec_on(&fresh, "SELECT sum(n) FROM t", &[]).unwrap();
+    eprintln!("r4 D1c: fresh conn after C's commit sees sum(n) = {}", int(&rows[0][0]));
+    assert_eq!(int(&rows[0][0]), 0, "a rolled-back UPDATE reached a commit");
+    integrity_on(&mut h, &fresh);
+}
+
+/// P1 regression probe: a writer's read that parks on credits past the
+/// limit returns Busy mid-opcode; the step ends without mid_op, so its
+/// claim is cleared. Continue it and check the invariants.
+#[test]
+fn r4_busy_read_mid_statement_then_continue() {
+    for credits in [2u32, 3, 4, 5, 6] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            read_delay: 2,
+            ..Cfg::default()
+        });
+        h.fill("t", 30);
+        let w = h.conn.clone();
+        h.ok("BEGIN");
+        h.ok("UPDATE t SET n = 1 WHERE id = 1");
+        let mut s = h.r.run(|| w.prepare("UPDATE t SET n = n + 1, v = zeroblob(950)")).unwrap();
+        let mut outcome = String::from("none");
+        let mut busy = 0;
+        h.r.credits = credits;
+        for _ in 0..400 {
+            let r = h.r.run(|| -> crate::Result<Option<String>> {
+                loop {
+                    match s.step()? {
+                        StepResult::Row => {}
+                        StepResult::Done => return Ok(Some("done".into())),
+                        StepResult::IO | StepResult::Yield => return Ok(None),
+                        o => return Ok(Some(format!("{o:?}"))),
+                    }
+                }
+            });
+            match r {
+                Ok(None) => {}
+                Ok(Some(x)) if x == "Busy" => {
+                    busy += 1;
+                    outcome = "busy".into();
+                    break;
+                }
+                Ok(Some(x)) => {
+                    outcome = x;
+                    break;
+                }
+                Err(e) => {
+                    outcome = format!("err {e}");
+                    break;
+                }
+            }
+        }
+        h.r.credits = super::DEFAULT_CREDITS;
+        let claims_after = h.sdb.test_claims();
+        let mut fin = String::new();
+        if busy > 0 {
+            // Resume the same statement with a normal grant.
+            let (done, _, other) = r4_step_rows(&mut h, &mut s, 10_000, usize::MAX);
+            fin = format!("resumed done={done} other={other:?}");
+        }
+        drop(s);
+        let st = h.stats();
+        eprintln!(
+            "r4 P1 credits={credits}: outcome {outcome}, claims after busy {claims_after:?}, {fin}, hard_rule_full {} credit_short {} doomed {}",
+            st.hard_rule_full, st.credit_short, st.doomed
+        );
+        let commit = h.exec("COMMIT");
+        eprintln!("r4 P1 credits={credits}: commit {:?}", commit.as_ref().map(|_| ()));
+        assert_eq!(st.hard_rule_full, 0, "credits={credits}: {st:?}");
+        assert_eq!(st.credit_short, 0, "credits={credits}: {st:?}");
+        let committed = commit.is_ok();
+        let fresh = h.connect();
+        let rows = h
+            .exec_on(&fresh, "SELECT count(*), sum(n) FROM t", &[])
+            .unwrap();
+        let (count, sum) = (int(&rows[0][0]), int(&rows[0][1]));
+        eprintln!("r4 P1 credits={credits}: fresh {count} rows sum {sum}");
+        assert_eq!(count, 120);
+        if committed {
+            // The whole UPDATE (resumed to the end) or none of it.
+            assert!(sum == 1 || sum == 121, "credits={credits}: partial update, sum {sum}");
+            if fin.starts_with("resumed done=true") {
+                assert_eq!(sum, 121, "credits={credits}: a resumed update lost rows");
+            }
+        } else {
+            assert_eq!(sum, 0, "credits={credits}: a failed commit landed");
+        }
+        integrity_on(&mut h, &fresh);
+    }
+}
+
+/// C: drop the connection while its COMMIT is parked part way (credits
+/// short, some pages staged by the commit loop). Nothing may land.
+#[test]
+fn r4_drop_mid_commit_is_atomic() {
+    for credits in [4u32, 5, 6, 8] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        h.fill("t", 10);
+        let c2 = h.connect();
+        h.exec_on(&c2, "BEGIN", &[]).unwrap();
+        h.exec_on(&c2, BIG_INSERT, &[]).unwrap();
+        let commits = h.stats().txn_commits;
+        h.r.credits = credits;
+        let mut stmt = h.r.run(|| c2.prepare("COMMIT")).unwrap();
+        let done = step_for(&mut h, &mut stmt, 1).unwrap_or(false);
+        let parts = h.stats().parts;
+        drop(stmt);
+        drop(c2);
+        h.r.credits = super::DEFAULT_CREDITS;
+        for _ in 0..4 {
+            h.r.run(|| {});
+        }
+        let n = h.one("SELECT count(*) FROM t");
+        eprintln!(
+            "r4 C credits={credits}: commit done in one run {done}, parts {parts}, txn_commits {} -> {}, txn_open {}, rows {n}",
+            commits,
+            h.stats().txn_commits,
+            h.sdb.txn_open()
+        );
+        if !done {
+            assert_eq!(n, 40, "a dropped COMMIT landed part of its transaction");
+        }
+        h.ok("INSERT INTO t(id, n, v) VALUES (99999, 0, 1)");
+        h.integrity();
+    }
+}
+
+/// C': a COMMIT statement reset while parked, then the connection keeps
+/// writing and COMMITs again: the commit is whole.
+#[test]
+fn r4_reset_parked_commit_then_commit() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let w = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT);
+    h.r.credits = 5;
+    let mut stmt = h.r.run(|| w.prepare("COMMIT")).unwrap();
+    let done = step_for(&mut h, &mut stmt, 1).unwrap_or(false);
+    let _ = h.r.run(|| stmt.reset());
+    drop(stmt);
+    h.r.credits = super::DEFAULT_CREDITS;
+    eprintln!("r4 C': first COMMIT done {done}, autocommit {}", w.get_auto_commit());
+    if !w.get_auto_commit() {
+        h.ok("UPDATE t SET n = 3 WHERE id = 1");
+        h.ok("COMMIT");
+    } else {
+        h.ok("UPDATE t SET n = 3 WHERE id = 1");
+    }
+    let fresh = h.connect();
+    let rows = h
+        .exec_on(&fresh, "SELECT count(*), sum(n) FROM t", &[])
+        .unwrap();
+    eprintln!("r4 C': fresh {} rows sum {}", int(&rows[0][0]), int(&rows[0][1]));
+    integrity_on(&mut h, &fresh);
+}
+
+/// Two writers and a reader with savepoints, with the losing writer
+/// dropped at every step of the winner's transaction.
+#[test]
+fn r4_drop_loser_and_reader_each_step() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let w = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    let mut stmt = h.r.run(|| w.prepare(BIG_INSERT)).unwrap();
+    let mut rounds = 0;
+    while !step_for(&mut h, &mut stmt, 2).unwrap() {
+        rounds += 1;
+        let l = h.connect();
+        let _ = rv_step_all(&mut h, &l, "BEGIN");
+        let _ = rv_step_all(&mut h, &l, "INSERT INTO t(id, n, v) VALUES (88888, 0, 1)");
+        drop(l);
+        let r = h.connect();
+        h.exec_on(&r, "BEGIN", &[]).unwrap();
+        h.exec_on(&r, "SAVEPOINT s", &[]).unwrap();
+        let rows = h.exec_on(&r, "SELECT count(*) FROM t", &[]).unwrap();
+        assert_eq!(int(&rows[0][0]), 40, "reader saw uncommitted rows");
+        h.exec_on(&r, "ROLLBACK TO s", &[]).unwrap();
+        drop(r);
+    }
+    drop(stmt);
+    assert!(rounds > 0);
+    h.ok("RELEASE a");
+    h.ok("COMMIT");
+    let fresh = h.connect();
+    let rows = h.exec_on(&fresh, "SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 40 + 1201);
+    integrity_on(&mut h, &fresh);
+}
+
+
+/// C with a large arena: the COMMIT loop stages part of the dirty set
+/// (credits short) and parks; then the connection is dropped, or the
+/// statement reset and the transaction committed later.
+#[test]
+fn r4_big_arena_partial_commit() {
+    for mode in ["drop", "reset_then_commit"] {
+        let mut h = H::open(Cfg {
+            slots: 4096,
+            ..Cfg::default()
+        });
+        h.fill("t", 10);
+        let c2 = h.connect();
+        h.exec_on(&c2, "BEGIN", &[]).unwrap();
+        h.exec_on(&c2, "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1000 UNION ALL SELECT i + 1 FROM c WHERE i < 7000) SELECT i, 1, zeroblob(900) FROM c", &[]).unwrap();
+        let spilled = h.stats().spilled_pages;
+        h.r.credits = 2;
+        let mut stmt = h.r.run(|| c2.prepare("COMMIT")).unwrap();
+        let done = step_for(&mut h, &mut stmt, 3).unwrap_or(false);
+        let st = h.stats();
+        eprintln!("r4 C2 {mode}: spilled before commit {spilled}, commit done {done}, parts {}, txn_open {}, txn_commits {}", st.parts, h.sdb.txn_open(), st.txn_commits);
+        h.r.credits = super::DEFAULT_CREDITS;
+        if mode == "drop" {
+            drop(stmt);
+            drop(c2);
+            for _ in 0..4 { h.r.run(|| {}); }
+            let n = h.one("SELECT count(*) FROM t");
+            eprintln!("r4 C2 drop: rows {n} txn_open {}", h.sdb.txn_open());
+            assert!(n == 40 || (done && n == 40 + 6001), "partial commit: {n}");
+        } else {
+            let _ = h.r.run(|| stmt.reset());
+            drop(stmt);
+            eprintln!("r4 C2 reset: autocommit {}", c2.get_auto_commit());
+            let r = if c2.get_auto_commit() { Ok(vec![]) } else { h.exec_on(&c2, "COMMIT", &[]) };
+            eprintln!("r4 C2 reset: second commit {:?}", r.map(|_| ()));
+            let n = h.one("SELECT count(*) FROM t");
+            eprintln!("r4 C2 reset: rows {n}");
+            assert!(n == 40 || n == 40 + 6001, "partial commit: {n}");
+        }
+        h.integrity();
+    }
+}
+
+/// Round 4: `begin_write_tx` aborts a store transaction a gone writer
+/// left open. The hook skips the writer's own aborts (rollback and
+/// `end_write_tx`), so the dropped writer's transaction is still open when
+/// the next writer begins.
+#[test]
+fn begin_write_tx_aborts_a_leftover_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    h.sdb.test_set_skip_end_abort(true);
+    drop_a_spilled_writer(&mut h, BIG_INSERT);
+    h.sdb.test_set_skip_end_abort(false);
+    assert!(h.sdb.txn_open(), "the hook left the dropped writer's txn open");
+    let aborts = h.stats().aborts;
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    assert!(h.stats().aborts > aborts, "the leftover was not aborted");
+    h.ok("COMMIT");
+    assert_eq!(fresh_count(&mut h, 1000, 2200), 0, "the leftover committed");
+    assert_eq!(fresh_count(&mut h, 1, 1_000_000), 40);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
+    h.integrity();
+}
+
+/// Round 4: a read whose credits never come (one credit a run, a read at
+/// a fresh version needs a pin and the read) fails SQLITE_BUSY after the
+/// read-park limit, not never. The statement then resumes at the same PC
+/// with a normal grant and reads the right answer.
+#[test]
+fn read_parks_are_bounded_busy() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 30);
+    h.ok("UPDATE t SET n = 1");
+    let r = h.connect();
+    let mut stmt = h.r.run(|| r.prepare("SELECT id, n FROM t")).unwrap();
+    h.r.credits = 1;
+    let start = h.r.runs;
+    let (done, rows, other) = r4_step_rows(&mut h, &mut stmt, 4 * 64 + 16, usize::MAX);
+    let used = h.r.runs - start;
+    assert!(!done, "finished on one credit a run");
+    assert_eq!(other.as_deref(), Some("Busy"), "rows {}", rows.len());
+    assert!(used <= 4 * 64 + 8, "gave up after {used} runs");
+    h.r.credits = super::DEFAULT_CREDITS;
+    let (done, rest, other) = r4_step_rows(&mut h, &mut stmt, 10_000, usize::MAX);
+    assert!(done, "{other:?}");
+    assert_eq!(rows.len() + rest.len(), 120);
+    assert!(rows.iter().chain(&rest).all(|&n| n == 1));
+    drop(stmt);
+    h.check_invariants();
+    assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
+}
+
+/// Round 4: a savepoint restore that never gets a credit is bounded too,
+/// by the larger restore limit (past the plain one), and then dooms the
+/// transaction: nothing commits and the connection recovers.
+#[test]
+fn restore_parks_are_bounded() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    let before = h.stats();
+    let conn = h.conn.clone();
+    h.r.credits = 0;
+    let start = h.r.runs;
+    let mut err = None;
+    for sql in ["ROLLBACK TO a", "SELECT sum(n) FROM t"] {
+        let mut stmt = h.r.run(|| conn.prepare(sql)).unwrap();
+        let mut finished = false;
+        for _ in 0..8 * 1024 {
+            match step_for(&mut h, &mut stmt, 1) {
+                Ok(false) => {}
+                Ok(true) => {
+                    finished = true;
+                    break;
+                }
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        assert!(finished || err.is_some(), "{sql}: no end after {} runs", h.r.runs - start);
+        if err.is_some() {
+            break;
+        }
+    }
+    let used = h.r.runs - start;
+    h.r.credits = super::DEFAULT_CREDITS;
+    let err = err.expect("the restore parks are bounded");
+    assert!(is_full(&err), "expected SQLITE_FULL, got {err}");
+    assert!(used > 2 * 64, "gave up after {used} runs: the plain limit");
+    assert!(used <= 4 * 1024, "gave up after {used} runs");
+    let s = h.stats();
+    assert!(s.doomed > before.doomed, "{s:?}");
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
+    h.integrity();
+}

@@ -49,11 +49,30 @@ impl StreamWal {
         &self.db
     }
 
+    /// The writer reads `Latest` (its staged parts included); everyone
+    /// else reads its snapshot. With no read transaction open (a sibling
+    /// statement's autocommit ended it while this one is still stepping)
+    /// that is still the connection's last read version, which is what its
+    /// page cache holds: never `Latest`, which would show another
+    /// connection's staged, uncommitted pages. Such a read takes a pin of
+    /// its own (0 holders, unpinned when it completes); a version the store
+    /// has dropped fails the statement SQLITE_BUSY.
     fn read_at(&self) -> ReadAt {
-        if self.writing.load(Ordering::Acquire) || !self.reading.load(Ordering::Acquire) {
+        if self.writing.load(Ordering::Acquire) {
             ReadAt::Latest
         } else {
             ReadAt::Version(self.read_version.load(Ordering::Acquire))
+        }
+    }
+
+
+    /// The writer gives up its own store transaction (rollback, end of
+    /// the write). A test can skip it to leave a transaction behind, as a
+    /// writer gone without either would; `begin_write_tx`'s abort of a
+    /// leftover is never skipped.
+    fn abort_own(&self) {
+        if !self.db.test_skips_end_abort() {
+            self.db.txn_abort();
         }
     }
 
@@ -155,9 +174,18 @@ impl Wal for StreamWal {
         if self.writing.swap(false, Ordering::AcqRel) {
             // A write transaction that ends without its commit (a dropped
             // connection, a rollback) leaves nothing open on the store.
-            self.db.txn_abort();
-            // Our own commit moved the head: our cache already matches it.
+            self.abort_own();
+            // The head is ours (we hold the writer lock): our commit's, or
+            // unchanged after a rollback. The cache matches it (the pager
+            // clears it on rollback), so it is the version this
+            // connection's statements read at from here, moving the hold
+            // with it if a read transaction is still open.
             let head = self.db.head();
+            let old = self.read_version.swap(head, Ordering::AcqRel);
+            if old != head && self.reading.load(Ordering::Acquire) {
+                self.db.hold(head);
+                self.db.release(old);
+            }
             self.seen.store(head, Ordering::Release);
             self.db.unlock_writer();
         }
@@ -353,7 +381,7 @@ impl Wal for StreamWal {
         // Only the writer's transaction is open on the store; a reader's
         // rollback must not abort it.
         if rollback_to.is_none() && self.writing.load(Ordering::Acquire) {
-            self.db.txn_abort();
+            self.abort_own();
         }
     }
 

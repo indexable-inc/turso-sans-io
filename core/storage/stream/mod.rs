@@ -263,6 +263,9 @@ struct Inner {
     stats: StreamStats,
     /// The database size in pages, last seen in a loaded page 1 (0: never).
     size_hint: u32,
+    /// Test hook: see `test_set_skip_end_abort`.
+    #[cfg(test)]
+    skip_end_abort: bool,
 }
 
 /// The op list and the state every connection of one database shares.
@@ -323,6 +326,8 @@ impl StreamDb {
                 keep: Vec::new(),
                 stats: StreamStats::default(),
                 size_hint: 0,
+                #[cfg(test)]
+                skip_end_abort: false,
             }),
             caches: Mutex::new(Vec::new()),
         })
@@ -1110,6 +1115,21 @@ impl StreamDb {
         g.part_writes = 0;
         g.stats.txn_commits += 1;
         Ok(v)
+    }
+
+    /// Test hook: the writer's own aborts (`rollback`, `end_write_tx`) are
+    /// skipped, as for a writer gone without running them, so the next
+    /// `begin_write_tx`'s abort of the leftover is the only one.
+    #[cfg(test)]
+    pub(crate) fn test_set_skip_end_abort(&self, on: bool) {
+        self.inner.lock().skip_end_abort = on;
+    }
+
+    pub(crate) fn test_skips_end_abort(&self) -> bool {
+        #[cfg(test)]
+        return self.inner.lock().skip_end_abort;
+        #[cfg(not(test))]
+        false
     }
 
     /// Abort the open transaction (ABORT never completes and needs no
