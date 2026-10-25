@@ -794,7 +794,13 @@ impl StreamDb {
         if want == 0 {
             g.claims.remove(&key);
         } else {
-            g.claims.insert(key, Claim { slots: want, records: 0 });
+            g.claims.insert(
+                key,
+                Claim {
+                    slots: want,
+                    records: 0,
+                },
+            );
         }
         true
     }
@@ -1050,7 +1056,11 @@ impl StreamDb {
     #[cfg(test)]
     pub(crate) fn test_claims(&self) -> Vec<(ClaimKey, Claim)> {
         let g = self.inner.lock();
-        g.claims.sorted().into_iter().map(|(k, c)| (k, *c)).collect()
+        g.claims
+            .sorted()
+            .into_iter()
+            .map(|(k, c)| (k, *c))
+            .collect()
     }
 
     /// Test hook: the credit state, for a stuck test's message.
