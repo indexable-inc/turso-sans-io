@@ -287,6 +287,20 @@ impl Pager {
 
     fn doomed_error(&self) -> Option<LimboError> {
         let sp = self.sp();
+        // The lock-free `gate` is only right if every change to `doomed`
+        // or `restore` went through `StreamPager::lock` (whose guard
+        // republishes it): a direct `state.lock()` that changed either would
+        // leave it stale. Checked under the raw lock, so the check itself
+        // republishes nothing.
+        #[cfg(debug_assertions)]
+        {
+            let st = sp.state.lock();
+            debug_assert_eq!(
+                sp.gated(),
+                st.doomed.is_some() || st.restore.is_some(),
+                "stream gate flag is stale: state was changed without StreamPager::lock"
+            );
+        }
         if !sp.gated() {
             return None;
         }
