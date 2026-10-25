@@ -656,6 +656,42 @@ impl PageCache {
             && !page.is_pinned()
             && page.get().id().ne(&DatabaseHeader::PAGE_ID)
             && Arc::strong_count(page) == 1
+            // A lent slot is still being copied by the host: evicting the
+            // page would let the slot be reused before the copy.
+            && !page.buffer_lent()
+    }
+
+    /// Evict one evictable page regardless of capacity, freeing its buffer.
+    /// Returns false when nothing is evictable.
+    pub fn evict_one_page(&mut self) -> bool {
+        self.len() > 0 && self.evict_one().is_ok()
+    }
+
+    /// Number of pages that could be evicted right now (O(n)).
+    pub fn evictable_pages(&self) -> usize {
+        self.count_evictable_pages()
+    }
+
+    /// Dirty pages that could be spilled now, up to `max_pages`, sorted by id.
+    pub fn spillable_pages(&self, max_pages: usize) -> Vec<PinGuard> {
+        let mut out = Vec::new();
+        for (_, &entry_ptr) in self.map.iter() {
+            if out.len() >= max_pages {
+                break;
+            }
+            let entry = unsafe { &*entry_ptr };
+            if Self::spillable(&entry.page) {
+                out.push(PinGuard::new(entry.page.clone()));
+            }
+        }
+        out.sort_by_key(|pg| pg.get().id());
+        out
+    }
+
+    /// Create a cache with spilling on regardless of the target (the
+    /// stream-backed pager spills into transaction parts on wasm too).
+    pub fn new_spilling(capacity: usize) -> Self {
+        Self::new_with_spill(capacity, true)
     }
 
     /// Evicts a single page using the SIEVE algorithm

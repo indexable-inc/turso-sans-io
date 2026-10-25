@@ -1016,6 +1016,15 @@ impl Page {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOCKED != 0
     }
 
+    /// True while the page's buffer slot is lent to the host for copying
+    /// (staged with a `write_arena` this run). Such a page must not be
+    /// evicted, since its slot cannot be reused before the copy, and must
+    /// not be modified in place.
+    #[inline]
+    pub fn buffer_lent(&self) -> bool {
+        self.get().buffer().is_some_and(|b| b.is_lent())
+    }
+
     #[inline]
     pub fn set_locked(&self) {
         self.get().flags.fetch_or(PAGE_LOCKED, Ordering::Acquire);

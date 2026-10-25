@@ -892,6 +892,22 @@ impl Buffer {
         Self::Pooled(buf)
     }
 
+    /// The page-arena slot of a pooled buffer.
+    pub fn arena_slot(&self) -> Option<u32> {
+        match self {
+            Self::Pooled(buf) => Some(buf.slot()),
+            _ => None,
+        }
+    }
+
+    /// True while a pooled buffer's slot is lent to the host for copying.
+    pub fn is_lent(&self) -> bool {
+        match self {
+            Self::Pooled(buf) => buf.is_lent(),
+            _ => false,
+        }
+    }
+
     pub fn new_temporary(size: usize) -> Self {
         TEMP_BUFFER_CACHE.with(|cache| {
             if let Some(buffer) = cache.borrow_mut().get_buffer(size) {

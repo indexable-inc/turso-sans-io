@@ -557,7 +557,8 @@ pub fn begin_read_page(
     group: Option<&mut CompletionGroup>,
 ) -> Result<Completion> {
     tracing::trace!("begin_read_btree_page(page_idx = {})", page_idx);
-    let buf = buffer_pool.get_page();
+    // A strict pool (one arena, no heap fallback) may be out of slots.
+    let buf = buffer_pool.try_get_page().ok_or(LimboError::DatabaseFull)?;
     #[allow(clippy::arc_with_non_send_sync)]
     let buf = Arc::new(buf);
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {

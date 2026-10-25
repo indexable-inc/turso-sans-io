@@ -65,6 +65,16 @@ impl ArenaBuffer {
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.logical_len()) }
     }
+
+    /// The arena slot this buffer occupies.
+    pub const fn slot(&self) -> u32 {
+        self.slot_idx
+    }
+
+    /// True while the slot is lent to the host (see [`BufferPool::lend`]).
+    pub fn is_lent(&self) -> bool {
+        self.arena.is_lent(self.slot_idx)
+    }
 }
 
 impl Drop for ArenaBuffer {
@@ -111,6 +121,10 @@ struct PoolInner {
     /// The `[Database::page_size]`, which the `page_arena` will use to
     /// return buffers from `Self::get_page`.
     db_page_size: OnceLock<usize>,
+    /// No temporary-buffer fallback for page-sized allocations: the page
+    /// arena is the only source of page buffers (see
+    /// [`BufferPool::new_external`]).
+    strict: bool,
 }
 
 unsafe impl Sync for PoolInner {}
@@ -149,7 +163,100 @@ impl BufferPool {
                 arena_size,
                 db_page_size: OnceLock::new(),
                 io: None,
+                strict: false,
             }),
+        }
+    }
+
+    /// A pool over caller-owned memory: `slots` page buffers of `page_size`
+    /// bytes starting at `base`, which must stay valid (and must not be
+    /// touched by anyone else) for the pool's lifetime. The pool is strict:
+    /// [`BufferPool::try_get_page`] returns `None` when every slot is in use,
+    /// and nothing on the page path falls back to heap buffers. There is no
+    /// WAL frame arena.
+    ///
+    /// # Safety
+    /// `base` must point to `slots * page_size` writable bytes that outlive
+    /// the pool.
+    /// A pool with no arena: every buffer is a heap buffer. For ephemeral
+    /// tables of a database whose own pool is strict.
+    /// The page size is fixed at once, so `finalize_with_page_size` never
+    /// builds an arena (it would need an IO).
+    pub fn new_heap(page_size: usize) -> Arc<Self> {
+        let pool = Arc::new(BufferPool::new(Self::MIN_ARENA_SIZE));
+        let _ = pool.inner_mut().db_page_size.set(page_size);
+        pool
+    }
+
+    pub unsafe fn new_external(base: NonNull<u8>, slots: u32, page_size: usize) -> Arc<Self> {
+        let pool = Arc::new(BufferPool::new(Self::MIN_ARENA_SIZE));
+        let inner = pool.inner_mut();
+        inner.strict = true;
+        let _ = inner.db_page_size.set(page_size);
+        inner.page_arena = Some(Arc::new(Arena::new_external(base, slots, page_size)));
+        pool
+    }
+
+    /// True for a pool made by [`BufferPool::new_external`].
+    pub fn is_strict(&self) -> bool {
+        self.inner().strict
+    }
+
+    /// A page buffer from the page arena, or `None` when every slot is in
+    /// use. Never a heap buffer for a strict pool; a non-strict pool falls
+    /// back to a temporary buffer as [`BufferPool::get_page`] does.
+    #[inline]
+    pub fn try_get_page(&self) -> Option<Buffer> {
+        let inner = self.inner();
+        let size = inner.get_db_page_size();
+        match inner
+            .page_arena
+            .as_ref()
+            .and_then(|a| Arena::try_alloc(a, size))
+        {
+            Some(b) => Some(b),
+            None if inner.strict => None,
+            None => Some(Buffer::new_temporary(size)),
+        }
+    }
+
+    /// Slot accounting of the page arena: (total, free, lent).
+    pub fn page_slots(&self) -> (u32, u32, u32) {
+        match self.inner().page_arena.as_ref() {
+            Some(a) => (a.n_slots(), a.free_count(), a.lent_count()),
+            None => (0, 0, 0),
+        }
+    }
+
+    /// Base address of the page arena.
+    pub fn page_arena_base(&self) -> Option<NonNull<u8>> {
+        self.inner().page_arena.as_ref().map(|a| a.base)
+    }
+
+    /// Lend `buf`'s slot to the host until [`BufferPool::end_run`]: the host
+    /// copies it then. While lent, dropping the buffer does not free the
+    /// slot (it is freed by `end_run`), and the page cache does not evict a
+    /// page that holds it. Returns the slot, or `None` for a buffer that is
+    /// not from the page arena.
+    pub fn lend(&self, buf: &Buffer) -> Option<u32> {
+        let Buffer::Pooled(b) = buf else {
+            return None;
+        };
+        let arena = self.inner().page_arena.as_ref()?;
+        if !Arc::ptr_eq(arena, &b.arena) {
+            return None;
+        }
+        arena.lend(b.slot_idx);
+        Some(b.slot_idx)
+    }
+
+    /// The host has copied every lent slot: they are no longer lent, and
+    /// slots whose buffers were dropped meanwhile are freed. Returns how many
+    /// slots were lent.
+    pub fn end_run(&self) -> u32 {
+        match self.inner().page_arena.as_ref() {
+            Some(a) => a.end_run(),
+            None => 0,
         }
     }
 
@@ -344,6 +451,13 @@ struct Arena {
     arena_size: usize,
     /// Slot size the total arena is divided into.
     slot_size: usize,
+    /// Memory is owned by the caller (`new_external`): never unmapped here.
+    external: bool,
+    /// Slots lent to the host until the end of the run (bit set = lent).
+    lent: Box<[std::sync::atomic::AtomicU64]>,
+    /// Lent slots whose buffer was dropped: freed at the end of the run.
+    released_while_lent: Box<[std::sync::atomic::AtomicU64]>,
+    lent_count: AtomicUsize,
 }
 
 // SAFETY: Arena's base pointer comes from mmap and is never aliased. All mutable
@@ -353,8 +467,16 @@ unsafe impl Sync for Arena {}
 
 impl Drop for Arena {
     fn drop(&mut self) {
-        unsafe { arena::dealloc(self.base.as_ptr(), self.arena_size) };
+        if !self.external {
+            unsafe { arena::dealloc(self.base.as_ptr(), self.arena_size) };
+        }
     }
+}
+
+fn bitmap_words(n_slots: usize) -> Box<[std::sync::atomic::AtomicU64]> {
+    (0..n_slots.div_ceil(64))
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect()
 }
 
 /// Slots 0 and 1 will be reserved for Arenas which are registered buffers
@@ -401,7 +523,89 @@ impl Arena {
             allocated_slots: AtomicUsize::new(0),
             slot_size,
             arena_size: rounded_bytes,
+            external: false,
+            lent: bitmap_words(rounded_slots),
+            released_while_lent: bitmap_words(rounded_slots),
+            lent_count: AtomicUsize::new(0),
         })
+    }
+
+    /// An arena over caller-owned memory. Slots past `slots` (the bitmap
+    /// rounds up to 64) are allocated up front and never handed out.
+    fn new_external(base: NonNull<u8>, slots: u32, slot_size: usize) -> Self {
+        turso_assert!(slots > 0, "external arena needs at least one slot");
+        let rounded = (slots as usize).div_ceil(64) * 64;
+        let map = AtomicSlotBitmap::new(rounded as u32);
+        // Reserve the padding slots so they are never allocated.
+        let mut taken = Vec::new();
+        while let Some(i) = map.alloc_one() {
+            if i >= slots {
+                continue;
+            }
+            taken.push(i);
+        }
+        for i in taken {
+            map.free_one(i);
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::AcqRel);
+        Self {
+            id,
+            base,
+            free_slots: map,
+            allocated_slots: AtomicUsize::new(0),
+            slot_size,
+            arena_size: slots as usize * slot_size,
+            external: true,
+            lent: bitmap_words(rounded),
+            released_while_lent: bitmap_words(rounded),
+            lent_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn n_slots(&self) -> u32 {
+        (self.arena_size / self.slot_size) as u32
+    }
+
+    fn free_count(&self) -> u32 {
+        self.n_slots() - self.allocated_slots.load(Ordering::Acquire) as u32
+    }
+
+    fn lent_count(&self) -> u32 {
+        self.lent_count.load(Ordering::Acquire) as u32
+    }
+
+    fn is_lent(&self, slot: u32) -> bool {
+        let (w, b) = ((slot / 64) as usize, slot % 64);
+        self.lent[w].load(Ordering::Acquire) & (1u64 << b) != 0
+    }
+
+    fn lend(&self, slot: u32) {
+        let (w, b) = ((slot / 64) as usize, slot % 64);
+        let old = self.lent[w].fetch_or(1u64 << b, Ordering::AcqRel);
+        if old & (1u64 << b) == 0 {
+            self.lent_count.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    fn end_run(&self) -> u32 {
+        let mut n = 0;
+        for (w, word) in self.lent.iter().enumerate() {
+            let lent = word.swap(0, Ordering::AcqRel);
+            if lent == 0 {
+                continue;
+            }
+            n += lent.count_ones();
+            let released = self.released_while_lent[w].swap(0, Ordering::AcqRel);
+            let mut r = released & lent;
+            while r != 0 {
+                let b = r.trailing_zeros();
+                r &= r - 1;
+                self.free_slots.free_one(w as u32 * 64 + b);
+                self.allocated_slots.fetch_sub(1, Ordering::AcqRel);
+            }
+        }
+        self.lent_count.store(0, Ordering::Release);
+        n
     }
 
     /// Allocate a `Buffer` large enough for logical length `size`.
@@ -434,6 +638,12 @@ impl Arena {
             !self.free_slots.is_free(slot_idx),
             "must not already be marked free"
         );
+        if self.is_lent(slot_idx) {
+            // The host has not copied it yet: free it at the end of the run.
+            let (w, b) = ((slot_idx / 64) as usize, slot_idx % 64);
+            self.released_while_lent[w].fetch_or(1u64 << b, Ordering::AcqRel);
+            return;
+        }
         self.free_slots.free_one(slot_idx);
         self.allocated_slots.fetch_sub(1, Ordering::AcqRel);
     }
