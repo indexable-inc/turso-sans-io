@@ -2054,6 +2054,8 @@ fn r4_sibling_reader_after_own_commit_sees_uncommitted() {
     eprintln!("r4 D1: fresh conn sees sum(n) = {}", int(&rows[0][0]));
     assert_eq!(sevens, 0, "a reader saw another connection's uncommitted rows");
     assert_eq!(after, 0, "the connection's cache kept rolled-back pages");
+    assert_eq!(other, None);
+    assert_eq!(first.len() + rest.len(), 400, "the scan ended early");
 }
 
 /// D1b: the same through BEGIN; SELECT (partly); COMMIT.
@@ -2067,7 +2069,7 @@ fn r4_reader_after_explicit_commit_sees_uncommitted() {
     let c = h.conn.clone();
     h.ok("BEGIN");
     let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
-    let (done, _, other) = r4_step_rows(&mut h, &mut s, 1000, 4);
+    let (done, first, other) = r4_step_rows(&mut h, &mut s, 1000, 4);
     assert!(!done && other.is_none(), "{other:?}");
     let commit = h.exec("COMMIT");
     eprintln!("r4 D1b: COMMIT with a reader mid-scan: {:?}", commit.as_ref().map(|_| ()));
@@ -2083,6 +2085,8 @@ fn r4_reader_after_explicit_commit_sees_uncommitted() {
     eprintln!("r4 D1b: after rollback conn sees sum(n) = {after}");
     assert_eq!(sevens, 0, "a reader saw another connection's uncommitted rows");
     assert_eq!(after, 0, "the connection's cache kept rolled-back pages");
+    assert_eq!(other, None);
+    assert_eq!(first.len() + rest.len(), 400, "the scan ended early");
 }
 
 /// D1c: the contaminated cache is then written on: C commits a change on
@@ -2114,90 +2118,81 @@ fn r4_contaminated_cache_then_commit() {
     integrity_on(&mut h, &fresh);
 }
 
-/// P1 regression probe: a writer's read that parks on credits past the
-/// limit returns Busy mid-opcode; the step ends without mid_op, so its
-/// claim is cleared. Continue it and check the invariants.
+/// P1 regression probe: an autocommit writer's read misses get no credit
+/// past the park limit, so it returns Busy mid-opcode (x6's recipe: 6
+/// runs in, then 0 credits). Resumed with a normal grant it finishes, and
+/// either all of it lands or none.
 #[test]
 fn r4_busy_read_mid_statement_then_continue() {
-    for credits in [2u32, 3, 4, 5, 6] {
-        let mut h = H::open(Cfg {
-            slots: 64,
-            read_delay: 2,
-            ..Cfg::default()
+    let mut h = H::open(Cfg {
+        slots: 64,
+        read_delay: 2,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let w = h.connect();
+    let mut s = h
+        .r
+        .run(|| w.prepare("UPDATE t SET n = n + 1, v = zeroblob(950)"))
+        .unwrap();
+    assert!(!step_for(&mut h, &mut s, 6).unwrap(), "finished before the squeeze");
+    h.r.credits = 0;
+    let mut outcome = String::from("none");
+    let mut busy = 0;
+    for _ in 0..400 {
+        let r = h.r.run(|| -> crate::Result<Option<String>> {
+            loop {
+                match s.step()? {
+                    StepResult::Row => {}
+                    StepResult::Done => return Ok(Some("done".into())),
+                    StepResult::IO | StepResult::Yield => return Ok(None),
+                    o => return Ok(Some(format!("{o:?}"))),
+                }
+            }
         });
-        h.fill("t", 30);
-        let w = h.conn.clone();
-        h.ok("BEGIN");
-        h.ok("UPDATE t SET n = 1 WHERE id = 1");
-        let mut s = h.r.run(|| w.prepare("UPDATE t SET n = n + 1, v = zeroblob(950)")).unwrap();
-        let mut outcome = String::from("none");
-        let mut busy = 0;
-        h.r.credits = credits;
-        for _ in 0..400 {
-            let r = h.r.run(|| -> crate::Result<Option<String>> {
-                loop {
-                    match s.step()? {
-                        StepResult::Row => {}
-                        StepResult::Done => return Ok(Some("done".into())),
-                        StepResult::IO | StepResult::Yield => return Ok(None),
-                        o => return Ok(Some(format!("{o:?}"))),
-                    }
-                }
-            });
-            match r {
-                Ok(None) => {}
-                Ok(Some(x)) if x == "Busy" => {
-                    busy += 1;
-                    outcome = "busy".into();
-                    break;
-                }
-                Ok(Some(x)) => {
-                    outcome = x;
-                    break;
-                }
-                Err(e) => {
-                    outcome = format!("err {e}");
-                    break;
-                }
+        match r {
+            Ok(None) => {}
+            Ok(Some(x)) if x == "Busy" => {
+                busy += 1;
+                outcome = "busy".into();
+                break;
+            }
+            Ok(Some(x)) => {
+                outcome = x;
+                break;
+            }
+            Err(e) => {
+                outcome = format!("err {e}");
+                break;
             }
         }
-        h.r.credits = super::DEFAULT_CREDITS;
-        let claims_after = h.sdb.test_claims();
-        let mut fin = String::new();
-        if busy > 0 {
-            // Resume the same statement with a normal grant.
-            let (done, _, other) = r4_step_rows(&mut h, &mut s, 10_000, usize::MAX);
-            fin = format!("resumed done={done} other={other:?}");
-        }
-        drop(s);
-        let st = h.stats();
-        eprintln!(
-            "r4 P1 credits={credits}: outcome {outcome}, claims after busy {claims_after:?}, {fin}, hard_rule_full {} credit_short {} doomed {}",
-            st.hard_rule_full, st.credit_short, st.doomed
-        );
-        let commit = h.exec("COMMIT");
-        eprintln!("r4 P1 credits={credits}: commit {:?}", commit.as_ref().map(|_| ()));
-        assert_eq!(st.hard_rule_full, 0, "credits={credits}: {st:?}");
-        assert_eq!(st.credit_short, 0, "credits={credits}: {st:?}");
-        let committed = commit.is_ok();
-        let fresh = h.connect();
-        let rows = h
-            .exec_on(&fresh, "SELECT count(*), sum(n) FROM t", &[])
-            .unwrap();
-        let (count, sum) = (int(&rows[0][0]), int(&rows[0][1]));
-        eprintln!("r4 P1 credits={credits}: fresh {count} rows sum {sum}");
-        assert_eq!(count, 120);
-        if committed {
-            // The whole UPDATE (resumed to the end) or none of it.
-            assert!(sum == 1 || sum == 121, "credits={credits}: partial update, sum {sum}");
-            if fin.starts_with("resumed done=true") {
-                assert_eq!(sum, 121, "credits={credits}: a resumed update lost rows");
-            }
-        } else {
-            assert_eq!(sum, 0, "credits={credits}: a failed commit landed");
-        }
-        integrity_on(&mut h, &fresh);
     }
+    h.r.credits = super::DEFAULT_CREDITS;
+    assert!(busy > 0, "never reached BUSY: {outcome}");
+    // Resume the same statement with a normal grant.
+    let (done, _, other) = r4_step_rows(&mut h, &mut s, 10_000, usize::MAX);
+    drop(s);
+    let st = h.stats();
+    eprintln!(
+        "r4 P1: outcome {outcome}, resumed done={done} other={other:?}, hard_rule_full {} credit_short {} doomed {}",
+        st.hard_rule_full, st.credit_short, st.doomed
+    );
+    assert_eq!(st.hard_rule_full, 0, "{st:?}");
+    assert_eq!(st.credit_short, 0, "{st:?}");
+    assert!(h.sdb.test_claims().is_empty(), "claims left");
+    let fresh = h.connect();
+    let rows = h
+        .exec_on(&fresh, "SELECT count(*), sum(n) FROM t", &[])
+        .unwrap();
+    let (count, sum) = (int(&rows[0][0]), int(&rows[0][1]));
+    eprintln!("r4 P1: fresh {count} rows sum {sum}");
+    assert_eq!(count, 400);
+    if done {
+        assert_eq!(sum, 400, "a resumed update lost rows");
+    } else {
+        assert_eq!(sum, 0, "partial update, sum {sum}");
+    }
+    integrity_on(&mut h, &fresh);
 }
 
 /// C: drop the connection while its COMMIT is parked part way (credits
@@ -2466,4 +2461,297 @@ fn restore_parks_are_bounded() {
     h.ok("UPDATE t SET n = 1 WHERE id = 1");
     assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
     h.integrity();
+}
+
+// ---- review round 5 C1: one snapshot per connection while statements run --
+
+/// Step `stmt` for at most `runs` runs, collecting (col0, col1) of each row,
+/// up to `max` rows; with `stop_at_io` return at the first run that ends in
+/// IO. Returns (done, rows, other step result or error if any).
+fn x_step(
+    h: &mut H,
+    stmt: &mut crate::Statement,
+    runs: u64,
+    max: usize,
+    stop_at_io: bool,
+) -> (bool, Vec<(i64, i64)>, Option<String>) {
+    let mut out = Vec::new();
+    for _ in 0..runs {
+        let r = h.r.run(|| -> crate::Result<Option<Option<String>>> {
+            loop {
+                match stmt.step()? {
+                    StepResult::Row => {
+                        let row = stmt.row().expect("row");
+                        let v: Vec<Value> = row.get_values().cloned().collect();
+                        out.push((int(&v[0]), int(&v[1])));
+                        if out.len() >= max {
+                            return Ok(None);
+                        }
+                    }
+                    StepResult::Done => return Ok(Some(None)),
+                    StepResult::IO | StepResult::Yield => return Ok(None),
+                    o => return Ok(Some(Some(format!("{o:?}")))),
+                }
+            }
+        });
+        match r {
+            Ok(None) => {
+                if out.len() >= max || stop_at_io {
+                    return (false, out, None);
+                }
+            }
+            Ok(Some(None)) => return (true, out, None),
+            Ok(Some(Some(o))) => return (false, out, Some(o)),
+            Err(e) => return (false, out, Some(format!("error {e}"))),
+        }
+    }
+    (false, out, None)
+}
+
+/// Copy one row into `u` on `conn` (autocommit). `Err` is the step result
+/// or error that stopped it.
+fn c1_insert(h: &mut H, conn: &Arc<Connection>, id: i64, n: i64) -> std::result::Result<(), String> {
+    rv_step_all(h, conn, &format!("INSERT INTO u VALUES ({id}, {n})"))
+}
+
+/// The write upgrade on a stale snapshot fails BusySnapshot; in an
+/// autocommit statement upstream reports it as SQLITE_BUSY (`fail_step`),
+/// retryable once the connection's other statements end.
+fn is_busy_snapshot(msg: &str) -> bool {
+    msg == "Busy" || msg.contains(&LimboError::BusySnapshot.to_string())
+}
+
+/// C1 (x1): a long read on C outlives the read transaction a sibling
+/// reader's halt ended; another connection commits; a later statement on C
+/// starts a read transaction. Like SQLite (one read transaction while any
+/// statement runs) it rejoins C's version: the long scan is neither cut
+/// short nor mixed, and C's hold is gone once its last statement ends.
+#[test]
+fn c1_long_read_keeps_its_snapshot_across_sibling_statements() {
+    for park in [false, true] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            read_delay: 3,
+            ..Cfg::default()
+        });
+        h.fill("t", 100);
+        h.ok("CREATE TABLE u(x)");
+        let c = h.conn.clone();
+        let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+        let (_, mut rows, o) = x_step(&mut h, &mut s, 1000, 8, false);
+        assert!(o.is_none(), "{o:?}");
+        h.exec_on(&c, "SELECT count(*) FROM u", &[]).unwrap();
+        let d = h.connect();
+        h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+        if park {
+            // Leave a read of the long statement in flight at the old version.
+            let (_, more, o) = x_step(&mut h, &mut s, 1, usize::MAX, true);
+            assert!(o.is_none(), "park={park}: {o:?}");
+            rows.extend(more);
+        }
+        h.exec_on(&c, "SELECT count(*) FROM u", &[]).unwrap();
+        // A sibling read sees C's snapshot too, not D's commit.
+        let sib = h.exec_on(&c, "SELECT sum(n) FROM t", &[]).unwrap();
+        assert_eq!(int(&sib[0][0]), 0, "park={park}: a sibling read left C's snapshot");
+        let (done, rest, o) = x_step(&mut h, &mut s, 100_000, usize::MAX, false);
+        rows.extend(rest);
+        drop(s);
+        let mut ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+        ids.sort();
+        ids.dedup();
+        let sevens = rows.iter().filter(|r| r.1 == 7).count();
+        assert!(done && o.is_none(), "park={park}: done {done} {o:?}");
+        assert_eq!(rows.len(), 400, "park={park}: the scan ended early");
+        assert_eq!(ids.len(), 400, "park={park}: duplicate rows");
+        assert_eq!(sevens, 0, "park={park}: the scan saw a later commit");
+        assert!(
+            h.sdb.test_pins().is_empty(),
+            "park={park}: holds left with no statement running: {:?}",
+            h.sdb.test_pins()
+        );
+        // With no statement left C reads the head again.
+        assert_eq!(h.one("SELECT sum(n) FROM t"), 7 * 400);
+        h.check_invariants();
+        integrity_on(&mut h, &d);
+    }
+}
+
+/// C1 (x2): an app copies t into u row by row on C (autocommit INSERT per
+/// row) while the scan runs, and another connection commits once. The
+/// INSERT after that commit fails SQLITE_BUSY_SNAPSHOT (C's snapshot is
+/// stale); nothing mixed is committed.
+#[test]
+fn c1_app_copy_after_foreign_commit_is_busy_snapshot() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER)");
+    let c = h.conn.clone();
+    let d = h.connect();
+    let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+    let mut copied = 0;
+    let mut insert_err = None;
+    let mut seen = Vec::new();
+    'scan: loop {
+        let (done, rows, o) = x_step(&mut h, &mut s, 100_000, 1, false);
+        assert!(o.is_none(), "scan: {o:?}");
+        for (id, n) in rows {
+            seen.push(n);
+            if let Err(e) = c1_insert(&mut h, &c, id, n) {
+                insert_err = Some(e);
+                break 'scan;
+            }
+            copied += 1;
+            if copied == 20 {
+                h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    drop(s);
+    let fresh = h.connect();
+    let rows = h
+        .exec_on(&fresh, "SELECT count(*), sum(n = 7) FROM u", &[])
+        .unwrap();
+    let (cnt, sev) = (int(&rows[0][0]), int(&rows[0][1]));
+    // With the scan gone C reads the head again, and the write goes in.
+    c1_insert(&mut h, &c, 100_000, 1).unwrap();
+    eprintln!("c1 x2: copied {copied}, insert error {insert_err:?}; u has {cnt} rows, {sev} with n=7");
+    let err = insert_err.expect("the copy after the foreign commit succeeded");
+    assert!(is_busy_snapshot(&err), "{err}");
+    assert_eq!(copied, 20);
+    assert_eq!(cnt, 20);
+    assert_eq!(sev, 0, "a mixed copy was committed");
+    assert!(!seen.contains(&7), "the scan saw the later commit");
+    assert!(h.sdb.test_pins().is_empty(), "{:?}", h.sdb.test_pins());
+    integrity_on(&mut h, &fresh);
+}
+
+/// C1 (x7): the same with a materialized outer loop and re-seeks of `t`
+/// (or a correlated subquery): the outer rows and the inner lookups read
+/// one version, and the copy stops at BUSY_SNAPSHOT.
+#[test]
+fn c1_materialized_outer_loop_reads_one_version() {
+    for (i, sql) in [
+        "SELECT s.id, t.n FROM (SELECT id FROM t ORDER BY -id) AS s JOIN t ON t.id = s.id",
+        "WITH s AS MATERIALIZED (SELECT id FROM t ORDER BY -id) SELECT s.id, t.n FROM s JOIN t ON t.id = s.id",
+        "SELECT id, (SELECT n FROM t AS t2 WHERE t2.id = t.id) FROM t ORDER BY -id",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        h.fill("t", 100);
+        h.ok("CREATE TABLE u(id INTEGER PRIMARY KEY, n INTEGER)");
+        let c = h.conn.clone();
+        let d = h.connect();
+        let mut s = match h.r.run(|| c.prepare(sql)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("c1 x7[{i}] prepare failed: {e}");
+                continue;
+            }
+        };
+        let mut copied = 0;
+        let mut seen = Vec::new();
+        let mut err = None;
+        loop {
+            let (done, rows, o) = x_step(&mut h, &mut s, 100_000, 1, false);
+            assert!(o.is_none(), "x7[{i}] scan: {o:?}");
+            for (id, n) in rows {
+                seen.push(n);
+                if let Err(e) = c1_insert(&mut h, &c, id, n) {
+                    err = Some(e);
+                    break;
+                }
+                copied += 1;
+                if copied == 20 {
+                    h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+                }
+            }
+            if done || err.is_some() {
+                break;
+            }
+        }
+        drop(s);
+        let fresh = h.connect();
+        let rows = h
+            .exec_on(&fresh, "SELECT count(*), sum(n = 7) FROM u", &[])
+            .unwrap();
+        let (cnt, sev) = (int(&rows[0][0]), int(&rows[0][1]));
+        eprintln!("c1 x7[{i}]: err {err:?}; u has {cnt} rows, {sev} with n=7");
+        let err = err.unwrap_or_else(|| panic!("x7[{i}]: the copy after the foreign commit succeeded"));
+        assert!(is_busy_snapshot(&err), "x7[{i}]: {err}");
+        assert_eq!(cnt, 20, "x7[{i}]");
+        assert_eq!(sev, 0, "x7[{i}]: a mixed copy was committed");
+        assert!(!seen.contains(&7), "x7[{i}]: the query mixed versions");
+        assert!(h.sdb.test_pins().is_empty(), "x7[{i}]: {:?}", h.sdb.test_pins());
+        integrity_on(&mut h, &fresh);
+    }
+}
+
+/// C1, on the WAL itself: a read transaction that ends while another
+/// statement is active keeps its hold; the next one rejoins that version
+/// (cache kept) and a write on it is BUSY_SNAPSHOT; the last statement's
+/// end releases it. With one statement it starts at the head as before.
+#[test]
+fn c1_wal_keeps_the_hold_while_statements_run() {
+    use crate::storage::wal::{Wal, WalAutoActions};
+    let (db, _arena) = bare(16, u64::MAX / 2);
+    db.begin_run(16, u64::MAX / 2);
+    let wal = super::wal::StreamWal::new(db.clone());
+    let commit_one = || {
+        let p = page_buf(&db);
+        assert!(db.batch_write(0, &p).unwrap());
+        db.batch_commit().unwrap()
+    };
+    // Past version 1 (the page-1 init, which `begin_write_tx` lets a
+    // reader of version 0 through).
+    assert_eq!(commit_one(), 1);
+    wal.stream_root_statements(1);
+    wal.begin_read_tx().unwrap();
+    wal.stream_root_statements(2);
+    wal.end_read_tx();
+    assert_eq!(db.test_pins(), vec![(1, 1, false)], "kept for the running statement");
+    assert_eq!(commit_one(), 2);
+    assert!(!wal.begin_read_tx().unwrap(), "rejoined: the cache stays");
+    assert_eq!(db.test_pins(), vec![(1, 1, false)]);
+    assert!(matches!(
+        wal.begin_write_tx(WalAutoActions::empty()),
+        Err(LimboError::BusySnapshot)
+    ));
+    wal.end_read_tx();
+    wal.stream_root_statements(1);
+    assert_eq!(db.test_pins(), vec![(1, 1, false)], "one statement still runs");
+    wal.stream_root_statements(0);
+    assert!(db.test_pins().is_empty(), "the last statement released it");
+    // One statement: a new read transaction starts at the head.
+    wal.stream_root_statements(1);
+    assert!(wal.begin_read_tx().unwrap(), "the head moved");
+    assert_eq!(db.test_pins(), vec![(2, 1, false)]);
+    wal.end_read_tx();
+    assert!(db.test_pins().is_empty());
+    // A hold kept past the transaction moves to the head when a lone
+    // statement starts a new one.
+    wal.stream_root_statements(2);
+    wal.begin_read_tx().unwrap();
+    wal.end_read_tx();
+    assert_eq!(commit_one(), 3);
+    wal.stream_root_statements(1);
+    assert!(wal.begin_read_tx().unwrap(), "the head moved");
+    assert_eq!(db.test_pins(), vec![(3, 1, false)], "only the new version");
+    wal.end_read_tx();
+    wal.stream_root_statements(0);
+    assert!(db.test_pins().is_empty());
+    let mut ops = Vec::new();
+    db.take_ops(&mut ops);
+    drop(ops);
+    db.release_run();
 }

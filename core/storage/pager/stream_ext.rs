@@ -181,6 +181,16 @@ impl Pager {
 
     /// The stream transaction was aborted under this connection: its
     /// statement's abort must roll the whole transaction back.
+    /// Tell the stream WAL how many root statements the connection has
+    /// active (it keeps the connection's version while any is).
+    pub(crate) fn stream_root_statements(&self, active: i32) {
+        if self.stream.is_some() {
+            if let Some(wal) = self.wal.as_ref() {
+                wal.stream_root_statements(active);
+            }
+        }
+    }
+
     pub fn stream_doomed(&self) -> bool {
         self.stream
             .as_ref()

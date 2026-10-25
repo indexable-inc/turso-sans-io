@@ -18,7 +18,7 @@ use crate::storage::sqlite3_ondisk::{finish_read_page, PageSize};
 use crate::storage::wal::{
     CheckpointMode, CheckpointResult, PreparedFrames, RollbackTo, Wal, WalAutoActions,
 };
-use crate::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use crate::sync::Arc;
 use crate::types::{IOResult, IOResultOr};
 use crate::{CompletionError, LimboError, Result, SyncMode};
@@ -31,6 +31,13 @@ pub struct StreamWal {
     seen: AtomicU64,
     reading: AtomicBool,
     writing: AtomicBool,
+    /// This connection holds `read_version` (one `StreamDb::hold`). A read
+    /// transaction implies it; it outlives the transaction while other
+    /// statements on the connection are still active (`end_read_tx`).
+    holding: AtomicBool,
+    /// The connection's active root statements, as last told by
+    /// `stream_root_statements`.
+    statements: AtomicI32,
 }
 
 impl StreamWal {
@@ -42,6 +49,8 @@ impl StreamWal {
             seen: AtomicU64::new(head),
             reading: AtomicBool::new(false),
             writing: AtomicBool::new(false),
+            holding: AtomicBool::new(false),
+            statements: AtomicI32::new(0),
         }
     }
 
@@ -53,10 +62,11 @@ impl StreamWal {
     /// else reads its snapshot. With no read transaction open (a sibling
     /// statement's autocommit ended it while this one is still stepping)
     /// that is still the connection's last read version, which is what its
-    /// page cache holds: never `Latest`, which would show another
-    /// connection's staged, uncommitted pages. Such a read takes a pin of
-    /// its own (0 holders, unpinned when it completes); a version the store
-    /// has dropped fails the statement SQLITE_BUSY.
+    /// page cache holds and what the connection still holds (`holding`):
+    /// never `Latest`, which would show another connection's staged,
+    /// uncommitted pages. A read with no hold left takes a pin of its own
+    /// (0 holders, unpinned when it completes); a version the store has
+    /// dropped fails the statement SQLITE_BUSY.
     fn read_at(&self) -> ReadAt {
         if self.writing.load(Ordering::Acquire) {
             ReadAt::Latest
@@ -65,6 +75,12 @@ impl StreamWal {
         }
     }
 
+    /// Give up the hold on `read_version`, if it is still taken.
+    fn release_hold(&self) {
+        if self.holding.swap(false, Ordering::AcqRel) {
+            self.db.release(self.read_version.load(Ordering::Acquire));
+        }
+    }
 
     /// The writer gives up its own store transaction (rollback, end of
     /// the write). A test can skip it to leave a transaction behind, as a
@@ -110,19 +126,46 @@ pub(crate) fn page_read_completion(page: PageRef, page_idx: usize, buf: Arc<Buff
 }
 
 impl Wal for StreamWal {
+    /// A read transaction that starts while another statement on the
+    /// connection is still active (the caller is one of `statements`) and
+    /// the connection still holds its last version rejoins that version, as
+    /// SQLite keeps one read transaction while `nVdbeRead > 0`: the running
+    /// statement's cursors and the page cache stay valid, and every
+    /// statement on the connection reads one snapshot. A write on it after
+    /// another connection committed fails SQLITE_BUSY_SNAPSHOT
+    /// (`begin_write_tx`). Otherwise it starts at the head.
     fn begin_read_tx(&self) -> Result<bool> {
+        if !self.reading.load(Ordering::Acquire)
+            && self.holding.load(Ordering::Acquire)
+            && self.statements.load(Ordering::Acquire) > 1
+        {
+            self.reading.store(true, Ordering::Release);
+            let rv = self.read_version.load(Ordering::Acquire);
+            return Ok(self.seen.swap(rv, Ordering::AcqRel) != rv);
+        }
         let head = self.db.head();
         let old = self.read_version.swap(head, Ordering::AcqRel);
-        if !self.reading.swap(true, Ordering::AcqRel) {
+        if !self.holding.swap(true, Ordering::AcqRel) {
             self.db.hold(head);
         } else if old != head {
-            // Already reading at `old`: move the hold, or `old` stays held
-            // (and pinned) forever while `end_read_tx` releases `head`.
+            // Already holding `old` (reading, or kept past the last read
+            // transaction): move the hold, or `old` stays held (and pinned)
+            // forever while `end_read_tx` releases `head`.
             self.db.hold(head);
             self.db.release(old);
         }
+        self.reading.store(true, Ordering::Release);
         let changed = self.seen.swap(head, Ordering::AcqRel) != head;
         Ok(changed)
+    }
+
+    fn stream_root_statements(&self, active: i32) {
+        self.statements.store(active, Ordering::Release);
+        // The last statement is gone: a hold kept past the read
+        // transaction has no reader left.
+        if active <= 0 && !self.reading.load(Ordering::Acquire) {
+            self.release_hold();
+        }
     }
 
     fn mvcc_refresh_if_db_changed(&self) -> bool {
@@ -164,9 +207,17 @@ impl Wal for StreamWal {
         Ok(())
     }
 
+    /// The hold stays while another statement than the one ending (the
+    /// caller is one of `statements`) is still active: it may still be
+    /// stepping at this version (upstream ends the connection's read
+    /// transaction when a sibling halts), and a later statement rejoins it
+    /// (`begin_read_tx`). The last statement's end releases it
+    /// (`stream_root_statements`).
     fn end_read_tx(&self) {
-        if self.reading.swap(false, Ordering::AcqRel) {
-            self.db.release(self.read_version.load(Ordering::Acquire));
+        if self.reading.swap(false, Ordering::AcqRel)
+            && self.statements.load(Ordering::Acquire) <= 1
+        {
+            self.release_hold();
         }
     }
 
@@ -182,7 +233,7 @@ impl Wal for StreamWal {
             // with it if a read transaction is still open.
             let head = self.db.head();
             let old = self.read_version.swap(head, Ordering::AcqRel);
-            if old != head && self.reading.load(Ordering::Acquire) {
+            if old != head && self.holding.load(Ordering::Acquire) {
                 self.db.hold(head);
                 self.db.release(old);
             }

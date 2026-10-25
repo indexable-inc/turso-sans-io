@@ -4460,7 +4460,8 @@ impl Connection {
                 "cannot start a statement while a checkpoint is active",
             ));
         }
-        self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        let previous = self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        self.pager.load().stream_root_statements(previous + 1);
         Ok(())
     }
 

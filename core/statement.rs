@@ -610,6 +610,7 @@ impl Statement {
                 .connection
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
+            conn.pager.load().stream_root_statements(previous - 1);
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
             }

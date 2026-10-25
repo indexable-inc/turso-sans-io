@@ -637,6 +637,10 @@ pub trait Wal: Debug + Send + Sync {
         None
     }
 
+    /// Stream storage: the connection now has `active` root statements
+    /// (`Connection::n_active_root_statements`). Every other WAL ignores it.
+    fn stream_root_statements(&self, _active: i32) {}
+
     /// Begin a write transaction.
     ///
     /// `allowed_auto_actions` controls which automatic WAL maintenance
