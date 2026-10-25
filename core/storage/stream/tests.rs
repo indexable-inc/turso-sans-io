@@ -904,7 +904,7 @@ fn other_statements_ending_keep_the_writers_claim() {
         credits: super::MIN_CREDITS,
         ..Cfg::default()
     });
-    h.fill("t", 100);
+    h.fill("t", 300);
     let reader = h.connect();
     let conn = h.conn.clone();
     h.ok("BEGIN");
@@ -913,6 +913,10 @@ fn other_statements_ending_keep_the_writers_claim() {
     // (statement, its connection is the writer's, rows seen)
     let mut other: Option<(crate::Statement, bool, i64)> = None;
     let (mut ended, mut sibling_ended) = (0u32, 0u32);
+    // Ends of the other statement while the writer held a claim; the
+    // claim must still be there after.
+    let mut ended_under_claim = 0u32;
+    let sdb = h.sdb.clone();
     let mut update_done = false;
     for i in 0.. {
         assert!(i < MAX_RUNS, "no progress: {}", h.sdb.test_credit_state());
@@ -940,7 +944,18 @@ fn other_statements_ending_keep_the_writers_claim() {
                 other = Some((c.prepare(sql).expect("prepare"), sibling, 0));
             }
             if let Some((s, sibling, rows)) = other.as_mut() {
+                let claims_before = sdb.test_claims();
                 if step(s, rows) {
+                    if !claims_before.is_empty() {
+                        let after = sdb.test_claims();
+                        for (k, _) in &claims_before {
+                            assert!(
+                                after.iter().any(|(k2, _)| k2 == k),
+                                "claim {k:?} cleared by another statement's end"
+                            );
+                        }
+                        ended_under_claim += 1;
+                    }
                     assert_eq!(*rows, 1);
                     if *sibling {
                         sibling_ended += 1;
@@ -962,10 +977,14 @@ fn other_statements_ending_keep_the_writers_claim() {
         ended > 0 && sibling_ended > 0,
         "statements ended mid-update: reader {ended}, sibling {sibling_ended}"
     );
+    assert!(
+        ended_under_claim > 0,
+        "no statement ended under the writer's claim"
+    );
     h.ok("COMMIT");
-    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 1200);
     let rows = h.exec_on(&reader, "SELECT sum(n) FROM t", &[]).unwrap();
-    assert_eq!(int(&rows[0][0]), 400);
+    assert_eq!(int(&rows[0][0]), 1200);
     h.integrity();
 }
 
@@ -1076,11 +1095,12 @@ fn begin_read_tx_twice_moves_the_hold() {
     db.release_run();
 }
 
-/// Round-2 C7 (spec case): the store's quota refuses the spill a
-/// savepoint restore needs. The transaction is doomed and aborted on the
+/// Round-2 C7 (spec case): with no quota left, a savepoint restore can't
+/// make room (the spill cap allows no page out, so its `ensure_slots`
+/// fails SQLITE_FULL). The transaction is doomed and aborted on the
 /// store, the statement fails SQLITE_FULL, and nothing of it commits.
 #[test]
-fn quota_refusing_a_restore_spill_dooms_the_txn() {
+fn quota_refusing_a_restore_dooms_the_txn() {
     let mut h = H::open(Cfg {
         slots: 64,
         quota: 100_000,
@@ -1110,4 +1130,116 @@ fn quota_refusing_a_restore_spill_dooms_the_txn() {
     h.ok("UPDATE t SET n = 1 WHERE id = 1");
     assert_eq!(h.one("SELECT sum(n) FROM t"), 1);
     h.integrity();
+}
+
+/// Round-3 B1: a trigger steps inside its parent's step. The parent's
+/// reserves after the trigger are its own again, and the trigger's claim
+/// ends with its step: a small arena makes progress and no claim is left.
+#[test]
+fn trigger_inside_a_writer_keeps_claims_apart() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    h.ok("CREATE TABLE log(x INTEGER)");
+    h.ok("CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (old.id); END");
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok("UPDATE t SET n = n + 1");
+    assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    assert_eq!(h.one("SELECT count(*) FROM log"), 400);
+    h.integrity();
+}
+
+/// Round-3 B2: a writer handing out rows (RETURNING runs all its DML
+/// first) holds no claim, so a query on its own connection, run to the
+/// end before the writer is stepped again, makes progress.
+#[test]
+fn returning_rows_hold_no_claim() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    let mut stmt =
+        h.r.run(|| conn.prepare("UPDATE t SET n = n + 1 RETURNING id"))
+            .unwrap();
+    let mut rows = 0i64;
+    let mut first = true;
+    for i in 0.. {
+        assert!(i < MAX_RUNS, "the update made no progress");
+        let st = h.r.run(|| loop {
+            match stmt.step().expect("step") {
+                StepResult::Row => return Some(true),
+                StepResult::Done => return None,
+                StepResult::IO | StepResult::Yield => return Some(false),
+                o => panic!("unexpected step result {o:?}"),
+            }
+        });
+        match st {
+            None => break,
+            Some(false) => {}
+            Some(true) => {
+                rows += 1;
+                if first {
+                    first = false;
+                    assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
+                    let got = h.exec_on(&conn, "SELECT sum(n) FROM t", &[]).unwrap();
+                    assert_eq!(int(&got[0][0]), 400);
+                }
+            }
+        }
+    }
+    drop(stmt);
+    assert_eq!(rows, 400);
+    h.ok("COMMIT");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 400);
+    h.integrity();
+}
+
+/// Round-3 C9: a second `begin_read_tx` across a head move after the old
+/// version was pinned sends exactly one UNPIN of it (the store panics on
+/// an UNPIN it did not pin) and holds only the new version.
+#[test]
+fn begin_read_tx_twice_unpins_the_old_version() {
+    use crate::storage::wal::Wal;
+    let (db, _arena) = bare(16, u64::MAX / 2);
+    let mut store = MemStore::new();
+    store.read_delay = 0;
+    let mut r = MemRunner::new(db.clone(), store);
+    let wal = super::wal::StreamWal::new(db.clone());
+    let page = Arc::new(crate::storage::pager::Page::new(1));
+    r.run(|| {
+        wal.begin_read_tx().unwrap();
+        let buf = page_buf(&db);
+        let c = super::wal::page_read_completion(page.clone(), 1, buf.clone());
+        assert!(db
+            .read(super::ReadAt::Version(0), 0, &buf, c)
+            .unwrap()
+            .is_some());
+        db.keep(buf);
+    });
+    r.run(|| {});
+    assert_eq!(db.test_pins(), vec![(0, 1, false)]);
+    assert_eq!(r.store.pins().get(&0), Some(&1));
+    r.run(|| {
+        let p1 = page_buf(&db);
+        assert!(db.batch_write(0, &p1).unwrap());
+        assert_eq!(db.batch_commit().unwrap(), 1);
+        assert!(wal.begin_read_tx().unwrap(), "the head moved");
+    });
+    assert_eq!(db.test_pins(), vec![(1, 1, false)], "only the new version");
+    assert!(
+        r.store.pins().is_empty(),
+        "version 0 unpinned once: {:?}",
+        r.store.pins()
+    );
+    r.run(|| wal.end_read_tx());
+    assert!(db.test_pins().is_empty());
 }

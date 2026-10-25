@@ -229,6 +229,9 @@ struct Inner {
     next_tag: u64,
     /// Op credits left in this run.
     credits: u32,
+    /// The largest credits any run reported (the handle's grant, less
+    /// nothing in flight): a hold above it can never be met.
+    max_credits: u32,
     /// Every statement's reservation. The slots they claim are kept free
     /// from everyone else; the credits their records' stages will take
     /// (`held`) are kept from reads and spills.
@@ -304,6 +307,7 @@ impl StreamDb {
                 pending: HashMap::new(),
                 next_tag: 1,
                 credits: DEFAULT_CREDITS,
+                max_credits: 0,
                 claims: BTreeMap::new(),
                 next_conn: 1,
                 notify: None,
@@ -358,6 +362,7 @@ impl StreamDb {
     pub fn begin_run(&self, credits: u32, quota_pages: u64) {
         let mut g = self.inner.lock();
         g.credits = credits;
+        g.max_credits = g.max_credits.max(credits);
         g.quota_left = quota_pages;
         g.stats.runs += 1;
     }
@@ -645,6 +650,16 @@ impl StreamDb {
         short
     }
 
+    /// Could the credits that every claim plus `records` more records
+    /// hold ever be met, with one left for a read? Judged against the
+    /// largest grant seen (a claim larger than that parks forever).
+    pub(crate) fn hold_can_fit(&self, extra: u64) -> bool {
+        let g = self.inner.lock();
+        let records: u64 = g.claims.values().map(|c| u64::from(c.records)).sum();
+        let hold = Self::hold_for(&g, records + extra);
+        g.max_credits == 0 || hold < g.max_credits
+    }
+
     pub(crate) fn bump_credit_wait(&self) {
         self.inner.lock().stats.credit_waits += 1;
     }
@@ -837,6 +852,13 @@ impl StreamDb {
             at: v,
             ..Default::default()
         });
+    }
+
+    /// Test hook: every claim now.
+    #[cfg(test)]
+    pub(crate) fn test_claims(&self) -> Vec<(ClaimKey, Claim)> {
+        let g = self.inner.lock();
+        g.claims.iter().map(|(k, c)| (*k, *c)).collect()
     }
 
     /// Test hook: the credit state, for a stuck test's message.

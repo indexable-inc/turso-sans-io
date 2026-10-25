@@ -1033,7 +1033,7 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     /// Stream storage: this statement's id in claim keys (see
-    /// `Pager::stream_set_owner`). Unique over the process.
+    /// `Pager::stream_swap_owner`). Unique over the process.
     stream_owner: u64,
     pub io_completions: Option<IOCompletions>,
     pub(crate) extension_state: crate::native_ext::ExtensionState,
@@ -1217,6 +1217,11 @@ unsafe impl Sync for ProgramState {}
 crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
+    /// This statement's id in stream claim keys.
+    pub(crate) fn stream_owner(&self) -> u64 {
+        self.stream_owner
+    }
+
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_databases = vec![None; max_cursors];
@@ -2514,11 +2519,21 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
+        // Stream storage: this step's reserves are this statement's; the
+        // caller's owner (a trigger steps inside its parent) comes back
+        // when it returns.
+        let stream_prev = pager
+            .is_stream()
+            .then(|| pager.stream_swap_owner(state.stream_owner));
         let result = if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
+        if let Some(prev) = stream_prev {
+            let mid_op = matches!(result, ProgramStep::IO | ProgramStep::Yield);
+            pager.stream_step_end(state.stream_owner, prev, mid_op);
+        }
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
@@ -2880,10 +2895,9 @@ impl Program {
         self.trace_registers(state, insn, vdbe_trace);
     }
 
-    /// Stream storage, at every step: the reserves this step makes are
-    /// this statement's, and a statement whose claim's records this run's
-    /// credits can't stage waits for a run that can (before it runs
-    /// anything, so it resumes where it was).
+    /// Stream storage, at every step: a statement whose claim's records
+    /// this run's credits can't stage waits for a run that can (before it
+    /// runs anything, so it resumes where it was).
     #[cold]
     #[inline(never)]
     fn stream_step_gate(
@@ -2892,7 +2906,6 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
-        pager.stream_set_owner(state.stream_owner);
         let c = pager.stream_resume_gate()?;
         self.park_on_io(state, IOCompletions(c), waker)
     }

@@ -170,11 +170,41 @@ impl Pager {
         (sp.conn, sp.st.lock().owner)
     }
 
-    /// The statement `owner` is stepping (every step sets it): reserves and
-    /// the slots and records they promise are its own.
-    pub fn stream_set_owner(&self, owner: u64) {
+    /// Statement `owner` starts a step: reserves and the slots and records
+    /// they promise are its own until the step returns. Returns the owner
+    /// it replaces (a trigger or nested statement steps inside its
+    /// parent's step), for [`Self::stream_step_end`].
+    ///
+    /// A nested step (the old owner is a statement mid-step: owners are
+    /// put back to 0 between top-level steps) runs from an opcode of its
+    /// parent that is not a b-tree mutation (Program, ParseSchema, ...),
+    /// so whatever the parent still claims is a finished opcode's
+    /// leftover: it ends here, or the child would count it as another
+    /// statement's and wait for it for ever. (A mutation re-reserves
+    /// right before each `add_dirty`, so dropping a claim never lets one
+    /// fail.)
+    pub fn stream_swap_owner(&self, owner: u64) -> u64 {
+        let Some(sp) = &self.stream else {
+            return 0;
+        };
+        let prev = std::mem::replace(&mut sp.st.lock().owner, owner);
+        if prev != 0 && prev != owner {
+            sp.db.clear_claim((sp.conn, prev));
+        }
+        prev
+    }
+
+    /// Statement `owner`'s step returned. Unless it stopped inside an
+    /// opcode (IO or a yield, `mid_op`), no opcode of it is running, so its
+    /// claim is over: a statement handing out rows, or a trigger that
+    /// finished, keeps nothing from its connection's other statements.
+    /// The parent's owner (`prev`) is back.
+    pub fn stream_step_end(&self, owner: u64, prev: u64, mid_op: bool) {
         if let Some(sp) = &self.stream {
-            sp.st.lock().owner = owner;
+            if !mid_op {
+                sp.db.clear_claim((sp.conn, owner));
+            }
+            sp.st.lock().owner = prev;
         }
     }
 
@@ -347,9 +377,15 @@ impl Pager {
                 });
                 return Err(stream::full().into());
             }
+            // A hold no run's credits could meet would park for ever.
+            if !db.hold_can_fit(u64::from(records - own.records)) {
+                db.bump(|s| s.reserve_full += 1);
+                return Err(stream::full().into());
+            }
         }
         let want = slots.max(own.slots);
-        return_if_io!(self.stream_ensure_slots(want));
+        // Claimed before making room: a spill there must leave the quota
+        // these records need (`stream_spill` caps by claimed records).
         db.set_claim(
             key,
             Claim {
@@ -357,6 +393,7 @@ impl Pager {
                 records,
             },
         );
+        return_if_io!(self.stream_ensure_slots(want));
         // BEGIN (until one is open) and the closing op of each part the
         // records open, over every claim.
         if records > 0 && db.credits() < db.held_credits() {
@@ -667,8 +704,8 @@ impl Pager {
     ) -> Result<()> {
         self.reset_internal_states();
         let db = self.sp().db.clone();
-        // The mutation of the statement rolling back is over.
-        db.clear_claim(self.stream_key());
+        // The claim of the statement rolling back ends with its step (or
+        // its reset), under its own key.
         if self.doomed_error().is_some() {
             // The transaction is gone; its rollback restores nothing.
             return Ok(());
@@ -934,7 +971,8 @@ impl Pager {
             return Ok(());
         }
         let id = page.get().id();
-        match self.page_cache.write().delete(PageCacheKey::new(id)) {
+        let deleted = self.page_cache.write().delete(PageCacheKey::new(id));
+        match deleted {
             Ok(()) => Ok(()),
             Err(CacheError::Dirty { .. }) => Err(self.stream_doom(LimboError::CompletionError(
                 CompletionError::IOError(

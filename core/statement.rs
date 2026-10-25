@@ -1700,6 +1700,10 @@ impl Statement {
 
         let mut reset_error: Option<LimboError> = None;
 
+        // Stream storage: whatever this statement's claim held is over,
+        // whichever way it ends (rollback, halt or plain reset).
+        self.pager.stream_end_statement(self.state.stream_owner());
+
         // Abandon an in-flight post-ANALYZE stats refresh. Its nested statement
         // is a read-only SELECT, so dropping it never has to block.
         self.analyze_refresh = None;
