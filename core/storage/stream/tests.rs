@@ -3208,3 +3208,362 @@ fn r4_busy_read_mid_statement_explicit_begin_sweep() {
         integrity_on(&mut h, &fresh);
     }
 }
+
+// ---- review round 6 (tswr11): schema on a kept snapshot ----------------------
+
+fn s7_rows(
+    h: &mut H,
+    c: &Arc<Connection>,
+    sql: &str,
+) -> std::result::Result<Vec<Vec<Value>>, String> {
+    h.exec_on(c, sql, &[]).map_err(|e| e.to_string())
+}
+
+fn ints(v: &[i64]) -> Vec<Vec<Value>> {
+    vec![v.iter().map(|&i| Value::from_i64(i)).collect()]
+}
+
+/// `r6_long_scan` with three rows in `u`.
+fn s7_long_scan(h: &mut H, halt_first: bool) -> (crate::Statement, Vec<(i64, i64)>) {
+    h.fill("t", 20);
+    h.ok("CREATE TABLE u(x)");
+    h.ok("INSERT INTO u VALUES (1), (2), (3)");
+    let c = h.conn.clone();
+    let mut s = h.r.run(|| c.prepare("SELECT id, n FROM t")).unwrap();
+    let (_, rows, o) = x_step(h, &mut s, 1000, 4, false);
+    assert!(o.is_none(), "{o:?}");
+    if halt_first {
+        h.exec_on(&c, "SELECT count(*) FROM u", &[]).unwrap();
+    }
+    (s, rows)
+}
+
+/// Step a statement of any columns to the end, collecting its rows.
+fn s7_collect(
+    h: &mut H,
+    stmt: &mut crate::Statement,
+) -> std::result::Result<Vec<Vec<Value>>, String> {
+    let mut got = Vec::new();
+    for _ in 0..100_000 {
+        let r = h.r.run(|| -> crate::Result<Option<StepResult>> {
+            loop {
+                match stmt.step()? {
+                    StepResult::Row => {
+                        got.push(stmt.row().unwrap().get_values().cloned().collect())
+                    }
+                    StepResult::IO | StepResult::Yield => return Ok(None),
+                    o => return Ok(Some(o)),
+                }
+            }
+        });
+        match r {
+            Ok(None) => {}
+            Ok(Some(StepResult::Done)) => return Ok(got),
+            Ok(Some(o)) => return Err(format!("{o:?}")),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err("no progress".into())
+}
+
+/// D's UPDATE then CREATE INDEX while C keeps its snapshot: C's reads
+/// neither see the update nor know the index; a statement C prepared during
+/// the hold runs on the shared schema once the scan is gone.
+#[test]
+fn s7_foreign_create_index_on_kept_snapshot() {
+    for halt_first in [false, true] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        let (s, rows) = s7_long_scan(&mut h, halt_first);
+        let c = h.conn.clone();
+        let d = h.connect();
+        h.exec_on(&d, "UPDATE t SET n = 7 WHERE id <= 10", &[])
+            .unwrap();
+        h.exec_on(&d, "CREATE INDEX tn ON t(n)", &[]).unwrap();
+        let what = format!("hf={halt_first}");
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*) FROM t WHERE n = 7"),
+            Ok(ints(&[0])),
+            "{what}: the held read saw D's update"
+        );
+        let e = s7_rows(
+            &mut h,
+            &c,
+            "SELECT count(*) FROM t INDEXED BY tn WHERE n = 0",
+        )
+        .expect_err("the index is not in C's snapshot");
+        assert!(e.contains("no such index"), "{what}: {e}");
+        let mut pre =
+            h.r.run(|| c.prepare("SELECT count(*) FROM t WHERE n = 7"))
+                .unwrap();
+        r6_finish_scan(&mut h, s, rows, &what);
+        assert_eq!(s7_collect(&mut h, &mut pre), Ok(ints(&[10])), "{what}");
+        drop(pre);
+        assert_eq!(
+            s7_rows(
+                &mut h,
+                &c,
+                "SELECT count(*) FROM t INDEXED BY tn WHERE n = 7"
+            ),
+            Ok(ints(&[10])),
+            "{what}"
+        );
+        assert_eq!(h.stats().blocking_calls, 0);
+        h.check_invariants();
+        integrity_on(&mut h, &c);
+    }
+}
+
+/// D drops `u` and a new table reuses its pages while C keeps its
+/// snapshot: C still reads `u` whole (a statement prepared before the DDL
+/// too) and knows no `w`; afterwards it has the shared schema.
+#[test]
+fn s7_foreign_drop_and_page_reuse_on_kept_snapshot() {
+    for halt_first in [false, true] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        let (s, rows) = s7_long_scan(&mut h, halt_first);
+        let c = h.conn.clone();
+        let mut pre =
+            h.r.run(|| c.prepare("SELECT count(*), sum(x) FROM u"))
+                .unwrap();
+        let d = h.connect();
+        h.exec_on(&d, "DROP TABLE u", &[]).unwrap();
+        h.exec_on(&d, "CREATE TABLE w(a)", &[]).unwrap();
+        h.exec_on(&d, "INSERT INTO w SELECT 100 FROM t", &[])
+            .unwrap();
+        let what = format!("hf={halt_first}");
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*), sum(x) FROM u"),
+            Ok(ints(&[3, 6])),
+            "{what}"
+        );
+        let e =
+            s7_rows(&mut h, &c, "SELECT count(*) FROM w").expect_err("w is not in C's snapshot");
+        assert!(e.contains("no such table"), "{what}: {e}");
+        assert_eq!(
+            s7_collect(&mut h, &mut pre),
+            Ok(ints(&[3, 6])),
+            "{what}: prepared before"
+        );
+        drop(pre);
+        r6_finish_scan(&mut h, s, rows, &what);
+        let e = s7_rows(&mut h, &c, "SELECT count(*) FROM u").expect_err("u is gone");
+        assert!(e.contains("no such table"), "{what}: {e}");
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*), sum(a) FROM w"),
+            Ok(ints(&[80, 8000])),
+            "{what}"
+        );
+        h.check_invariants();
+        integrity_on(&mut h, &c);
+    }
+}
+
+/// D's ALTER TABLE ADD COLUMN and an insert while C keeps its snapshot: C
+/// reads the old one-column `u`; a statement C prepared during the hold
+/// reprepares onto the new columns once the scan is gone.
+#[test]
+fn s7_foreign_alter_add_column_on_kept_snapshot() {
+    for halt_first in [false, true] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        let (s, rows) = s7_long_scan(&mut h, halt_first);
+        let c = h.conn.clone();
+        let d = h.connect();
+        h.exec_on(&d, "ALTER TABLE u ADD COLUMN y DEFAULT 5", &[])
+            .unwrap();
+        h.exec_on(&d, "INSERT INTO u VALUES (4, 9)", &[]).unwrap();
+        let what = format!("hf={halt_first}");
+        let one = |x: i64| vec![Value::from_i64(x)];
+        let two = |x: i64, y: i64| vec![Value::from_i64(x), Value::from_i64(y)];
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT * FROM u"),
+            Ok(vec![one(1), one(2), one(3)]),
+            "{what}: the held read used the new schema"
+        );
+        let mut during = h.r.run(|| c.prepare("SELECT * FROM u")).unwrap();
+        assert_eq!(during.num_columns(), 1, "{what}");
+        r6_finish_scan(&mut h, s, rows, &what);
+        let want = vec![two(1, 5), two(2, 5), two(3, 5), two(4, 9)];
+        assert_eq!(s7_collect(&mut h, &mut during), Ok(want.clone()), "{what}");
+        assert_eq!(
+            during.num_columns(),
+            2,
+            "{what}: a statement compiled during the hold kept a stale schema"
+        );
+        drop(during);
+        assert_eq!(s7_rows(&mut h, &c, "SELECT * FROM u"), Ok(want), "{what}");
+        h.check_invariants();
+        integrity_on(&mut h, &c);
+    }
+}
+
+/// DDL on C itself while its own long scan runs: the DDL commits, C sees
+/// its own schema at once, the scan reads neither the DDL nor D's later
+/// update. Dropping the table being scanned fails the scan (as on plain
+/// WAL, where turso lets the DROP free the pages under the cursor; SQLite
+/// refuses the DROP with SQLITE_LOCKED instead) and leaves the database
+/// intact.
+#[test]
+fn s7_own_ddl_mid_scan() {
+    for ddl in [
+        "CREATE INDEX tn2 ON t(n)",
+        "ALTER TABLE t ADD COLUMN q DEFAULT 1",
+        "CREATE TABLE k(a)",
+        "DROP TABLE u",
+        "DROP TABLE t",
+    ] {
+        for halt_first in [false, true] {
+            let mut h = H::open(Cfg {
+                slots: 64,
+                ..Cfg::default()
+            });
+            let (mut s, mut rows) = s7_long_scan(&mut h, halt_first);
+            let c = h.conn.clone();
+            let what = format!("{ddl} hf={halt_first}");
+            s7_rows(&mut h, &c, ddl).unwrap_or_else(|e| panic!("{what}: {e}"));
+            let u = s7_rows(&mut h, &c, "SELECT count(*) FROM u");
+            let d = h.connect();
+            let dw = s7_rows(&mut h, &d, "UPDATE t SET n = 7 WHERE id > 70");
+            let ct = s7_rows(&mut h, &c, "SELECT count(*) FROM t");
+            if ddl == "DROP TABLE u" {
+                assert!(u.unwrap_err().contains("no such table"), "{what}");
+            } else {
+                assert_eq!(u, Ok(ints(&[3])), "{what}");
+            }
+            if ddl == "DROP TABLE t" {
+                assert!(dw.unwrap_err().contains("no such table"), "{what}");
+                assert!(ct.unwrap_err().contains("no such table"), "{what}");
+                let (done, rest, o) = x_step(&mut h, &mut s, 100_000, usize::MAX, false);
+                rows.extend(rest);
+                drop(s);
+                assert!(
+                    !done && o.is_some(),
+                    "{what}: the scan of a dropped table ran on: {o:?}"
+                );
+                assert!(rows.iter().all(|r| r.1 != 7), "{what}");
+                assert!(
+                    h.sdb.test_pins().is_empty(),
+                    "{what}: {:?}",
+                    h.sdb.test_pins()
+                );
+            } else {
+                dw.unwrap_or_else(|e| panic!("{what}: D's update: {e}"));
+                assert_eq!(ct, Ok(ints(&[80])), "{what}");
+                r6_finish_scan(&mut h, s, rows, &what);
+                assert_eq!(h.one("SELECT count(*) FROM t WHERE n = 7"), 10, "{what}");
+            }
+            h.check_invariants();
+            let fresh = h.connect();
+            integrity_on(&mut h, &fresh);
+        }
+    }
+}
+
+/// An explicit BEGIN on C while it keeps a snapshot D has moved past (D
+/// created a table and updated `t`): C's reads in the transaction see its
+/// snapshot, its write fails BUSY_SNAPSHOT (not "Database schema changed"
+/// after the reprepare limit), the read-only COMMIT succeeds, and once the
+/// scan is gone C reads D's table and writes.
+#[test]
+fn s7_explicit_begin_on_kept_snapshot() {
+    for halt_first in [false, true] {
+        let mut h = H::open(Cfg {
+            slots: 64,
+            ..Cfg::default()
+        });
+        let (s, rows) = s7_long_scan(&mut h, halt_first);
+        let c = h.conn.clone();
+        let d = h.connect();
+        h.exec_on(&d, "CREATE TABLE z(y)", &[]).unwrap();
+        h.exec_on(&d, "UPDATE t SET n = 7", &[]).unwrap();
+        let what = format!("hf={halt_first}");
+        s7_rows(&mut h, &c, "BEGIN").unwrap();
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*) FROM u"),
+            Ok(ints(&[3])),
+            "{what}"
+        );
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*) FROM t WHERE n = 7"),
+            Ok(ints(&[0])),
+            "{what}"
+        );
+        let e = s7_rows(&mut h, &c, "INSERT INTO u VALUES (9)").expect_err("a stale write went in");
+        assert!(is_busy_snapshot(&e), "{what}: {e}");
+        s7_rows(&mut h, &c, "COMMIT").unwrap_or_else(|e| panic!("{what}: commit: {e}"));
+        r6_finish_scan(&mut h, s, rows, &what);
+        assert_eq!(
+            s7_rows(&mut h, &c, "SELECT count(*) FROM z"),
+            Ok(ints(&[0])),
+            "{what}"
+        );
+        s7_rows(&mut h, &c, "INSERT INTO u VALUES (10)").unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(h.one("SELECT count(*) FROM u WHERE x = 9"), 0, "{what}");
+        assert_eq!(h.one("SELECT count(*) FROM u WHERE x = 10"), 1, "{what}");
+        h.check_invariants();
+        integrity_on(&mut h, &c);
+    }
+}
+
+/// A write on C meets D's open write transaction (BUSY) while C's scan
+/// holds; the scan ends and D commits; the retry of the same statement
+/// fails BUSY_SNAPSHOT once (its read transaction is the old version), the
+/// next retry goes in, and nothing is held after.
+#[test]
+fn s7_busy_then_scan_ends_then_retry() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    let (s, rows) = s7_long_scan(&mut h, true);
+    let c = h.conn.clone();
+    let d = h.connect();
+    h.exec_on(&d, "BEGIN", &[]).unwrap();
+    h.exec_on(&d, "UPDATE t SET n = 7 WHERE id = 1", &[])
+        .unwrap();
+    let mut x = h.r.run(|| c.prepare("INSERT INTO u VALUES (50)")).unwrap();
+    let (_, o, _) = y_step_all(&mut h, &mut x);
+    assert_eq!(o.as_deref(), Some("Busy"), "first try");
+    r6_finish_scan_keeping(&mut h, s, rows, "s7 busy");
+    h.exec_on(&d, "COMMIT", &[]).unwrap();
+    let (_, o, _) = y_step_all(&mut h, &mut x);
+    let e = o.expect("the retry on the old version went in");
+    assert!(is_busy_snapshot(&e), "retry: {e}");
+    let (_, o, _) = y_step_all(&mut h, &mut x);
+    assert_eq!(o, None, "second retry");
+    drop(x);
+    assert!(h.sdb.test_pins().is_empty(), "{:?}", h.sdb.test_pins());
+    s7_rows(&mut h, &c, "INSERT INTO u VALUES (51)").unwrap();
+    assert_eq!(h.one("SELECT count(*) FROM u WHERE x >= 50"), 2);
+    assert_eq!(h.one("SELECT count(*) FROM t WHERE n = 7"), 1);
+    h.check_invariants();
+    integrity_on(&mut h, &c);
+}
+
+/// `r6_finish_scan` for a connection whose other statement (a write that
+/// got BUSY) still holds its read version: the scan is whole and saw no
+/// later commit; the hold may stay.
+fn r6_finish_scan_keeping(
+    h: &mut H,
+    mut s: crate::Statement,
+    mut rows: Vec<(i64, i64)>,
+    what: &str,
+) {
+    let (done, rest, o) = x_step(h, &mut s, 100_000, usize::MAX, false);
+    rows.extend(rest);
+    drop(s);
+    assert!(done && o.is_none(), "{what}: long scan done {done} {o:?}");
+    assert_eq!(rows.len(), 80, "{what}: the scan ended early");
+    assert!(
+        rows.iter().all(|r| r.1 != 7),
+        "{what}: the scan saw a later commit"
+    );
+}
