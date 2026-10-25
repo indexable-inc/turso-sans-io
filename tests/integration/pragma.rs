@@ -468,3 +468,21 @@ fn test_connection_pragma_waits_for_io() -> anyhow::Result<()> {
         .is_equal_to(vec![vec![Value::from_text("ok")]]);
     Ok(())
 }
+
+/// A pragma table-valued function must pass page reads of its helper
+/// statement up to the caller instead of reporting them as rows.
+#[test]
+fn test_pragma_vtab_waits_for_io() -> anyhow::Result<()> {
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file(io, "pragma-vtab-waits-for-io.db", Arc::new(SqliteDialect))?;
+    let conn = db.connect(ConnectOpts::new())?;
+    conn.execute("CREATE TABLE t1(a)")?;
+    conn.execute("INSERT INTO t1 VALUES (1)")?;
+    // A new connection starts with an empty page cache.
+    let conn = db.connect(ConnectOpts::new())?;
+    assert_that!(conn
+        .prepare("SELECT * FROM pragma_integrity_check()")?
+        .run_collect_rows()?)
+    .is_equal_to(vec![vec![Value::from_text("ok")]]);
+    Ok(())
+}
