@@ -179,8 +179,6 @@ impl Pager {
         self.stream.as_ref().expect("stream pager")
     }
 
-    /// The stream transaction was aborted under this connection: its
-    /// statement's abort must roll the whole transaction back.
     /// Tell the stream WAL how many root statements the connection has
     /// active (it keeps the connection's version while any is).
     pub(crate) fn stream_root_statements(&self, active: i32) {
@@ -191,6 +189,21 @@ impl Pager {
         }
     }
 
+    /// The connection holds a stream version older than the head: a read
+    /// transaction (or one kept for the connection's running statements)
+    /// that new statements rejoin. Its schema is that version's, so a newer
+    /// shared schema must not be adopted until the hold is gone, and a
+    /// write on it fails BUSY_SNAPSHOT for good (a retry rejoins it).
+    pub(crate) fn stream_snapshot_stale(&self) -> bool {
+        self.stream.is_some()
+            && self
+                .wal
+                .as_ref()
+                .is_some_and(|wal| wal.stream_snapshot_stale())
+    }
+
+    /// The stream transaction was aborted under this connection: its
+    /// statement's abort must roll the whole transaction back.
     pub fn stream_doomed(&self) -> bool {
         self.stream
             .as_ref()

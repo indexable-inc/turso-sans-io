@@ -2960,11 +2960,16 @@ impl Program {
     ) -> Option<ProgramStep> {
         match err.into_structured_constraint() {
             LimboError::Busy => Some(ProgramStep::Busy),
+            // An autocommit statement whose upgrade found its snapshot stale
+            // retries from a fresh one, so it is plain BUSY; but a stream
+            // connection that keeps its version for its other running
+            // statements rejoins that same version on every retry, so it
+            // is SQLITE_BUSY_SNAPSHOT, which no busy handler waits on.
             LimboError::BusySnapshot
                 if matches!(
                     self.connection.transaction_state.get(),
                     TransactionState::None | TransactionState::Pending { .. }
-                ) =>
+                ) && !pager.stream_snapshot_stale() =>
             {
                 Some(ProgramStep::Busy)
             }

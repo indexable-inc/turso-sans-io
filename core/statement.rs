@@ -605,12 +605,15 @@ impl Statement {
                     .n_active_blob_statements
                     .fetch_sub(1, Ordering::SeqCst);
             }
-            let previous = self
-                .program
-                .connection
-                .n_active_root_statements
-                .fetch_sub(1, Ordering::SeqCst);
-            conn.pager.load().stream_root_statements(previous - 1);
+            let previous = {
+                // Under the activity lock, as in `start_root_statement`, so
+                // the stream WAL's copy of the count follows every change
+                // in order.
+                let _activity = conn.statement_activity.lock();
+                let previous = conn.n_active_root_statements.fetch_sub(1, Ordering::SeqCst);
+                conn.pager.load().stream_root_statements(previous - 1);
+                previous
+            };
             if previous == 1 {
                 self.program.connection.clear_interrupt_if_idle();
             }

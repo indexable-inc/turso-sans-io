@@ -36,8 +36,14 @@ pub struct StreamWal {
     /// statements on the connection are still active (`end_read_tx`).
     holding: AtomicBool,
     /// The connection's active root statements, as last told by
-    /// `stream_root_statements`.
+    /// `stream_root_statements` (the connection updates its count and
+    /// tells this under its `statement_activity` lock, so the two agree).
     statements: AtomicI32,
+    /// The open (or last) read transaction rejoined a kept hold rather
+    /// than starting at the head: its end must not release the hold while
+    /// any statement is active, since its caller may not be one of them
+    /// (`end_read_tx`).
+    rejoined: AtomicBool,
 }
 
 impl StreamWal {
@@ -51,6 +57,7 @@ impl StreamWal {
             writing: AtomicBool::new(false),
             holding: AtomicBool::new(false),
             statements: AtomicI32::new(0),
+            rejoined: AtomicBool::new(false),
         }
     }
 
@@ -126,19 +133,19 @@ pub(crate) fn page_read_completion(page: PageRef, page_idx: usize, buf: Arc<Buff
 }
 
 impl Wal for StreamWal {
-    /// A read transaction that starts while another statement on the
-    /// connection is still active (the caller is one of `statements`) and
-    /// the connection still holds its last version rejoins that version, as
-    /// SQLite keeps one read transaction while `nVdbeRead > 0`: the running
-    /// statement's cursors and the page cache stay valid, and every
-    /// statement on the connection reads one snapshot. A write on it after
-    /// another connection committed fails SQLITE_BUSY_SNAPSHOT
+    /// A read transaction that starts while the connection still holds
+    /// its last version past the last read transaction (kept by
+    /// `end_read_tx` because a statement on it is still active) rejoins
+    /// that version, as SQLite keeps one read transaction while
+    /// `nVdbeRead > 0`: the running statement's cursors and the page cache
+    /// stay valid, and every statement on the connection reads one
+    /// snapshot. That holds for a new statement and for a read transaction
+    /// begun outside any statement (`maybe_reparse_schema`) alike. A write
+    /// on it after another connection committed fails SQLITE_BUSY_SNAPSHOT
     /// (`begin_write_tx`). Otherwise it starts at the head.
     fn begin_read_tx(&self) -> Result<bool> {
-        if !self.reading.load(Ordering::Acquire)
-            && self.holding.load(Ordering::Acquire)
-            && self.statements.load(Ordering::Acquire) > 1
-        {
+        if !self.reading.load(Ordering::Acquire) && self.holding.load(Ordering::Acquire) {
+            self.rejoined.store(true, Ordering::Release);
             self.reading.store(true, Ordering::Release);
             let rv = self.read_version.load(Ordering::Acquire);
             return Ok(self.seen.swap(rv, Ordering::AcqRel) != rv);
@@ -154,6 +161,7 @@ impl Wal for StreamWal {
             self.db.hold(head);
             self.db.release(old);
         }
+        self.rejoined.store(false, Ordering::Release);
         self.reading.store(true, Ordering::Release);
         let changed = self.seen.swap(head, Ordering::AcqRel) != head;
         Ok(changed)
@@ -166,6 +174,11 @@ impl Wal for StreamWal {
         if active <= 0 && !self.reading.load(Ordering::Acquire) {
             self.release_hold();
         }
+    }
+
+    fn stream_snapshot_stale(&self) -> bool {
+        self.holding.load(Ordering::Acquire)
+            && self.read_version.load(Ordering::Acquire) != self.db.head()
     }
 
     fn mvcc_refresh_if_db_changed(&self) -> bool {
@@ -211,13 +224,16 @@ impl Wal for StreamWal {
     /// caller is one of `statements`) is still active: it may still be
     /// stepping at this version (upstream ends the connection's read
     /// transaction when a sibling halts), and a later statement rejoins it
-    /// (`begin_read_tx`). The last statement's end releases it
-    /// (`stream_root_statements`).
+    /// (`begin_read_tx`). A rejoined transaction keeps it while any
+    /// statement is active: its caller may be outside them all (a schema
+    /// probe) while the one left still steps. The last statement's end
+    /// releases it (`stream_root_statements`).
     fn end_read_tx(&self) {
-        if self.reading.swap(false, Ordering::AcqRel)
-            && self.statements.load(Ordering::Acquire) <= 1
-        {
-            self.release_hold();
+        if self.reading.swap(false, Ordering::AcqRel) {
+            let statements = self.statements.load(Ordering::Acquire);
+            if statements <= 0 || (statements == 1 && !self.rejoined.load(Ordering::Acquire)) {
+                self.release_hold();
+            }
         }
     }
 

@@ -1244,7 +1244,16 @@ impl Connection {
             on_disk_schema_version
         };
 
-        let db_schema_version = self.db.schema.lock().schema_version;
+        // A stream connection that keeps an older version for its running
+        // statements read that version's cookie (its read transaction
+        // rejoined it): the schema to match is its own, not the newer
+        // shared one, which it may not adopt while the hold lasts
+        // (`maybe_update_schema`).
+        let db_schema_version = if pager.stream_snapshot_stale() {
+            self.schema.read().schema_version
+        } else {
+            self.db.schema.lock().schema_version
+        };
         tracing::debug!(
             "path: {}, db_schema_version={} vs on_disk_schema_version={}",
             self.db.path,
@@ -1966,6 +1975,15 @@ impl Connection {
         if !self.has_no_open_transaction_state() {
             return;
         }
+        // A stream connection that keeps an older version for its running
+        // statements compiles against that version's schema (the one it
+        // has), as SQLite compiles against its open read transaction's: a
+        // newer shared schema would fail every new statement's cookie check
+        // at the version it rejoins. It adopts the shared schema once the
+        // hold is gone.
+        if self.pager.load().stream_snapshot_stale() {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock();
         // MVCC checkpoint can publish physical btree roots into the shared
@@ -2048,6 +2066,12 @@ impl Connection {
     }
 
     pub(crate) fn refresh_schema_from_shared_for_reprepare(&self) {
+        // A kept stream snapshot: the connection's schema is that
+        // version's (`maybe_reparse_schema` parsed it there if it was not);
+        // see `maybe_update_schema`.
+        if self.pager.load().stream_snapshot_stale() {
+            return;
+        }
         let current_schema = self.schema.read().clone();
         let schema = self.db.schema.lock().clone();
         if current_schema.schema_version < schema.schema_version
@@ -4460,8 +4484,12 @@ impl Connection {
                 "cannot start a statement while a checkpoint is active",
             ));
         }
+        // The stream WAL's copy of the count is told under the activity
+        // lock (also in `release_active_root_if_counted`), so it follows
+        // every change in order.
         let previous = self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
         self.pager.load().stream_root_statements(previous + 1);
+        drop(activity);
         Ok(())
     }
 

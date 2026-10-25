@@ -641,6 +641,12 @@ pub trait Wal: Debug + Send + Sync {
     /// (`Connection::n_active_root_statements`). Every other WAL ignores it.
     fn stream_root_statements(&self, _active: i32) {}
 
+    /// Stream storage: the connection holds a version older than the head
+    /// (`Pager::stream_snapshot_stale`). Every other WAL says false.
+    fn stream_snapshot_stale(&self) -> bool {
+        false
+    }
+
     /// Begin a write transaction.
     ///
     /// `allowed_auto_actions` controls which automatic WAL maintenance
