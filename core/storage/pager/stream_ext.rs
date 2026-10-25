@@ -57,6 +57,10 @@ struct StreamPagerState {
     /// The statement stepping now (its claims are `(conn, owner)`); set at
     /// every step. 0: no statement (open, connect).
     owner: u64,
+    /// Records the reserve in progress will claim once it has made room:
+    /// a spill there leaves their quota (they are not claimed yet, so
+    /// their credits stay free for the spill).
+    pending_records: u64,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
@@ -176,13 +180,18 @@ impl Pager {
     /// parent's step), for [`Self::stream_step_end`].
     ///
     /// A nested step (the old owner is a statement mid-step: owners are
-    /// put back to 0 between top-level steps) runs from an opcode of its
-    /// parent that is not a b-tree mutation (Program, ParseSchema, ...),
-    /// so whatever the parent still claims is a finished opcode's
-    /// leftover: it ends here, or the child would count it as another
-    /// statement's and wait for it for ever. (A mutation re-reserves
-    /// right before each `add_dirty`, so dropping a claim never lets one
-    /// fail.)
+    /// put back to 0 between top-level steps) drops whatever the parent
+    /// still claims, or the child would count it as another statement's
+    /// and wait for it for ever. That is only sound because every nested
+    /// step starts from an opcode of the parent that is not a b-tree
+    /// mutation (Program for triggers and FK actions, ParseSchema,
+    /// InitCdcVersion, PopulateMaterializedViews, Vacuum, the sequence
+    /// functions, index-method DDL), so the parent's claim is a finished
+    /// opcode's leftover. Balance's `add_dirty`s are not re-checked one by
+    /// one (they rely on the opcode's claim), so a nested step started
+    /// inside Insert/Delete/IdxInsert/IdxDelete would let the child take
+    /// the parent's slots and the parent hit the hard rule mid-balance:
+    /// keep nested statements out of mutation opcodes.
     pub fn stream_swap_owner(&self, owner: u64) -> u64 {
         let Some(sp) = &self.stream else {
             return 0;
@@ -203,6 +212,11 @@ impl Pager {
         if let Some(sp) = &self.stream {
             if !mid_op {
                 sp.db.clear_claim((sp.conn, owner));
+                if prev == 0 {
+                    // Reserves made between top-level steps (a halt run by
+                    // reset, schema-version writes) are under owner 0.
+                    sp.db.clear_claim((sp.conn, 0));
+                }
             }
             sp.st.lock().owner = prev;
         }
@@ -346,6 +360,7 @@ impl Pager {
     pub(crate) fn stream_end_statement(&self, owner: u64) {
         if let Some(sp) = &self.stream {
             sp.db.clear_claim((sp.conn, owner));
+            sp.db.clear_claim((sp.conn, 0));
         }
     }
 
@@ -378,14 +393,19 @@ impl Pager {
                 return Err(stream::full().into());
             }
             // A hold no run's credits could meet would park for ever.
-            if !db.hold_can_fit(u64::from(records - own.records)) {
+            if !db.hold_can_fit(u64::from(records)) {
                 db.bump(|s| s.reserve_full += 1);
                 return Err(stream::full().into());
             }
         }
         let want = slots.max(own.slots);
-        // Claimed before making room: a spill there must leave the quota
-        // these records need (`stream_spill` caps by claimed records).
+        // Make room before claiming (the claim's hold would take the
+        // credits a spill needs), but tell the spill what quota these
+        // records will take.
+        self.sp().st.lock().pending_records = u64::from(records - own.records);
+        let room = self.stream_ensure_slots(want);
+        self.sp().st.lock().pending_records = 0;
+        return_if_io!(room);
         db.set_claim(
             key,
             Claim {
@@ -393,7 +413,6 @@ impl Pager {
                 records,
             },
         );
-        return_if_io!(self.stream_ensure_slots(want));
         // BEGIN (until one is open) and the closing op of each part the
         // records open, over every claim.
         if records > 0 && db.credits() < db.held_credits() {
@@ -500,7 +519,10 @@ impl Pager {
     /// staged part is only ever overwritten by a later one, never rewound.
     fn stream_spill(&self) -> Result<u32> {
         let db = &self.sp().db;
-        let quota = db.quota_left().saturating_sub(db.claimed_records());
+        let pending = self.sp().st.lock().pending_records;
+        let quota = db
+            .quota_left()
+            .saturating_sub(db.claimed_records() + pending);
         let room = db
             .writes_within(db.free_credits())
             .min(MAX_PART_PAGES as u64)

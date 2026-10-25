@@ -650,14 +650,18 @@ impl StreamDb {
         short
     }
 
-    /// Could the credits that every claim plus `records` more records
-    /// hold ever be met, with one left for a read? Judged against the
-    /// largest grant seen (a claim larger than that parks forever).
-    pub(crate) fn hold_can_fit(&self, extra: u64) -> bool {
+    /// Could the credits a claim of `records` records holds ever be met,
+    /// with two left for a read (a PIN and the READ)? Judged against the
+    /// largest credits any run reported (a claim past that parks for
+    /// ever); reported credits already leave out what the host holds (an
+    /// open transaction's BEGIN), so nothing more is taken off. Other
+    /// claims' holds end, so only this one counts.
+    pub(crate) fn hold_can_fit(&self, records: u64) -> bool {
         let g = self.inner.lock();
-        let records: u64 = g.claims.values().map(|c| u64::from(c.records)).sum();
-        let hold = Self::hold_for(&g, records + extra);
-        g.max_credits == 0 || hold < g.max_credits
+        if g.max_credits == 0 {
+            return true;
+        }
+        Self::hold_for(&g, records).saturating_add(2) <= g.max_credits
     }
 
     pub(crate) fn bump_credit_wait(&self) {
