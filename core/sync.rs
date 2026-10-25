@@ -204,7 +204,7 @@ mod shuttle_adapter {
 
 #[cfg(not(shuttle))]
 mod std_adapter {
-    pub use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+    pub use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
     pub use std::sync::{atomic, Arc, LazyLock, OnceLock, Weak};
 
     /// Type alias for ArcMutexGuard that hides the RawMutex type parameter

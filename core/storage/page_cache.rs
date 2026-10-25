@@ -436,6 +436,22 @@ impl PageCache {
         Ok(Some(page))
     }
 
+    /// Stream storage's lookup, in one map probe: `Ok` a hit (touched, as
+    /// [`Self::get`] does), `Err` the cached page whose read failed
+    /// (unloaded and unlocked: neither touched nor removed, the caller
+    /// decides), `None` a miss.
+    #[inline]
+    pub fn get_or_failed(&mut self, key: &PageCacheKey) -> Option<Result<PageRef, PageRef>> {
+        let &entry_ptr = self.map.get(key)?;
+        let entry = unsafe { &mut *entry_ptr };
+        let page = entry.page.clone();
+        if !page.is_loaded() && !page.is_locked() {
+            return Some(Err(page));
+        }
+        entry.bump_ref();
+        Some(Ok(page))
+    }
+
     #[inline]
     pub fn peek(&mut self, key: &PageCacheKey, touch: bool) -> Option<PageRef> {
         let &entry_ptr = self.map.get(key)?;

@@ -42,12 +42,78 @@ use crate::storage::stream::{
     self, Claim, ClaimKey, ReadAt, StreamDb, MAX_PART_PAGES, MAX_READ_PAGES, SCRATCH_BASE,
 };
 use crate::storage::wal::Wal;
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
+use crate::sync::MutexGuard;
 
+/// The pager's stream state. The fields only the stepping statement's own
+/// thread touches between its calls (the owner, the park count, the restore
+/// and mutation marks, the pending records) are atomics with `Relaxed`
+/// order: a connection is stepped by one thread at a time, and handing it to
+/// another thread already orders everything before. The rest is behind
+/// `state`, whose guard ([`StreamPager::lock`]) also republishes the two
+/// "anything to do?" flags (`gate`, `nested`) as it unlocks, so the per-page
+/// and per-step checks are one load each.
 pub(crate) struct StreamPager {
     pub(crate) db: Arc<StreamDb>,
     /// This connection's id in claim keys.
     conn: u64,
-    st: Mutex<StreamPagerState>,
+    state: Mutex<StreamPagerState>,
+    /// `doomed.is_some() || restore.is_some()` as of the last unlock: false
+    /// means `stream_gate` has nothing to do.
+    gate: AtomicBool,
+    /// `!parents.is_empty()` as of the last unlock.
+    nested: AtomicBool,
+    /// The atomics below are per connection and only its own statements
+    /// (one thread at a time) touch them: they are atomics for `Sync`, and
+    /// are read and written with plain loads and stores, no RMWs.
+    ///
+    /// The statement stepping now (its claims are `(conn, owner)`); set at
+    /// every step. 0: no statement (open, connect).
+    owner: AtomicU64,
+    /// Records the reserve in progress will claim once it has made room:
+    /// a spill there leaves their quota (they are not claimed yet, so
+    /// their credits stay free for the spill).
+    pending_records: AtomicU64,
+    /// A b-tree mutation opcode (Insert, Delete, IdxInsert, IdxDelete) is
+    /// running: no nested statement may step inside it (see
+    /// [`Pager::stream_swap_owner`]).
+    in_mutation: AtomicBool,
+    /// Credit parks in a row (a run's credits short of what a run with the
+    /// largest grant seen would have) since the last reserve that finished.
+    credit_parks: AtomicU32,
+    /// A savepoint restore is being driven (see `stream_gate`).
+    restoring: AtomicBool,
+}
+
+/// [`StreamPager::state`] locked; unlocking republishes `gate` and `nested`.
+struct StreamGuard<'a> {
+    sp: &'a StreamPager,
+    g: MutexGuard<'a, StreamPagerState>,
+}
+
+impl std::ops::Deref for StreamGuard<'_> {
+    type Target = StreamPagerState;
+    fn deref(&self) -> &StreamPagerState {
+        &self.g
+    }
+}
+
+impl std::ops::DerefMut for StreamGuard<'_> {
+    fn deref_mut(&mut self) -> &mut StreamPagerState {
+        &mut self.g
+    }
+}
+
+impl Drop for StreamGuard<'_> {
+    fn drop(&mut self) {
+        // Still under the lock: every change to these fields is published
+        // before the next locker (or flag reader on this thread) runs.
+        let gate = self.g.doomed.is_some() || self.g.restore.is_some();
+        self.sp.gate.store(gate, Ordering::Release);
+        self.sp
+            .nested
+            .store(!self.g.parents.is_empty(), Ordering::Release);
+    }
 }
 
 /// Credit parks in a row before a reserve gives up (SQLITE_FULL): about
@@ -60,22 +126,11 @@ const RESTORE_CREDIT_PARK_LIMIT: u32 = 1024;
 struct StreamPagerState {
     /// Record `i` (scratch page `SCRATCH_BASE + i`) holds this db page.
     index: Vec<u32>,
-    /// The statement stepping now (its claims are `(conn, owner)`); set at
-    /// every step. 0: no statement (open, connect).
-    owner: u64,
-    /// Records the reserve in progress will claim once it has made room:
-    /// a spill there leaves their quota (they are not claimed yet, so
-    /// their credits stay free for the spill).
-    pending_records: u64,
     /// (child, parent) for every nested statement that stepped inside its
     /// parent's step and stopped mid-opcode (a trigger waiting on IO, a
     /// nested ParseSchema): its claim ends when it finishes, or when the
     /// parent's statement ends (reset or drop mid-IO).
     parents: Vec<(u64, u64)>,
-    /// A b-tree mutation opcode (Insert, Delete, IdxInsert, IdxDelete) is
-    /// running: no nested statement may step inside it (see
-    /// [`Pager::stream_swap_owner`]).
-    in_mutation: bool,
     /// The store transaction this connection last staged into. Ownership
     /// of the open transaction is the write lock (`stream_owns_txn`: only
     /// the writer opens one, and `begin_write_tx` aborts any a gone writer
@@ -84,11 +139,6 @@ struct StreamPagerState {
     /// staged into (ours was aborted under us and a new one opened), the
     /// commit would land a partial transaction, so it dooms instead.
     txn: Option<u32>,
-    /// Credit parks in a row (a run's credits short of what a run with the
-    /// largest grant seen would have) since the last reserve that finished.
-    credit_parks: u32,
-    /// A savepoint restore is being driven (see `stream_gate`).
-    restoring: bool,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
@@ -104,7 +154,7 @@ pub struct StreamMutation {
 impl Drop for StreamMutation {
     fn drop(&mut self) {
         if let Some(sp) = &self.pager.stream {
-            sp.st.lock().in_mutation = self.was;
+            sp.in_mutation.store(self.was, Ordering::Relaxed);
         }
     }
 }
@@ -148,8 +198,33 @@ impl StreamPager {
         Self {
             db,
             conn,
-            st: Mutex::new(StreamPagerState::default()),
+            state: Mutex::new(StreamPagerState::default()),
+            gate: AtomicBool::new(false),
+            nested: AtomicBool::new(false),
+            owner: AtomicU64::new(0),
+            pending_records: AtomicU64::new(0),
+            in_mutation: AtomicBool::new(false),
+            credit_parks: AtomicU32::new(0),
+            restoring: AtomicBool::new(false),
         }
+    }
+
+    fn lock(&self) -> StreamGuard<'_> {
+        StreamGuard {
+            sp: self,
+            g: self.state.lock(),
+        }
+    }
+
+    /// Is a doom or a pending restore there (`stream_gate` has work)?
+    #[inline]
+    fn gated(&self) -> bool {
+        self.gate.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn key(&self) -> ClaimKey {
+        (self.conn, self.owner.load(Ordering::Relaxed))
     }
 }
 
@@ -207,11 +282,15 @@ impl Pager {
     pub fn stream_doomed(&self) -> bool {
         self.stream
             .as_ref()
-            .is_some_and(|s| s.st.lock().doomed.is_some())
+            .is_some_and(|s| s.gated() && s.lock().doomed.is_some())
     }
 
     fn doomed_error(&self) -> Option<LimboError> {
-        self.sp().st.lock().doomed.map(Doom::error)
+        let sp = self.sp();
+        if !sp.gated() {
+            return None;
+        }
+        sp.lock().doomed.map(Doom::error)
     }
 
     /// Give up the transaction (§14): abort it on the store now, so the
@@ -221,7 +300,7 @@ impl Pager {
         let db = &self.sp().db;
         let owns = self.stream_owns_txn();
         {
-            let mut st = self.sp().st.lock();
+            let mut st = self.sp().lock();
             if st.doomed.is_none() {
                 st.doomed = Some(Doom::of(&e));
                 st.restore = None;
@@ -251,7 +330,7 @@ impl Pager {
     /// connection's.
     fn stream_note_txn(&self) {
         let id = self.sp().db.txn_id();
-        self.sp().st.lock().txn = id;
+        self.sp().lock().txn = id;
     }
 
     /// Park for credits a later run will have, at most
@@ -267,18 +346,18 @@ impl Pager {
     /// dooms the whole transaction.
     fn stream_credit_park_or(&self, give_up: impl FnOnce() -> LimboError) -> IOResultOr<()> {
         let db = &self.sp().db;
-        let (n, limit) = {
-            let mut st = self.sp().st.lock();
-            st.credit_parks += 1;
-            let limit = if st.restoring {
-                RESTORE_CREDIT_PARK_LIMIT
-            } else {
-                CREDIT_PARK_LIMIT
-            };
-            (st.credit_parks, limit)
+        let sp = self.sp();
+        // Plain load and store, not an RMW: only this connection's own
+        // statements touch these per-connection fields, one at a time.
+        let n = sp.credit_parks.load(Ordering::Relaxed) + 1;
+        sp.credit_parks.store(n, Ordering::Relaxed);
+        let limit = if sp.restoring.load(Ordering::Relaxed) {
+            RESTORE_CREDIT_PARK_LIMIT
+        } else {
+            CREDIT_PARK_LIMIT
         };
         if n > limit {
-            self.sp().st.lock().credit_parks = 0;
+            sp.credit_parks.store(0, Ordering::Relaxed);
             db.bump(|s| s.reserve_full += 1);
             return Err(give_up().into());
         }
@@ -287,13 +366,12 @@ impl Pager {
     }
 
     fn stream_credit_parks_reset(&self) {
-        self.sp().st.lock().credit_parks = 0;
+        self.sp().credit_parks.store(0, Ordering::Relaxed);
     }
 
     /// The claim key of the statement stepping now.
     fn stream_key(&self) -> ClaimKey {
-        let sp = self.sp();
-        (sp.conn, sp.st.lock().owner)
+        self.sp().key()
     }
 
     /// Statement `owner` starts a step: reserves and the slots and records
@@ -318,13 +396,15 @@ impl Pager {
         let Some(sp) = &self.stream else {
             return 0;
         };
-        let mut st = sp.st.lock();
-        let prev = std::mem::replace(&mut st.owner, owner);
+        // Load and store, not a swap (see `stream_credit_park_or`).
+        let prev = sp.owner.load(Ordering::Relaxed);
+        sp.owner.store(owner, Ordering::Relaxed);
         if prev != 0 && prev != owner {
             debug_assert!(
-                !st.in_mutation,
+                !sp.in_mutation.load(Ordering::Relaxed),
                 "stream: a nested statement stepped inside a b-tree mutation opcode"
             );
+            let mut st = sp.lock();
             if !st.parents.iter().any(|&(c, _)| c == owner) {
                 st.parents.push((owner, prev));
             }
@@ -342,18 +422,17 @@ impl Pager {
     pub fn stream_step_end(&self, owner: u64, prev: u64, mid_op: bool) {
         if let Some(sp) = &self.stream {
             if !mid_op {
-                sp.db.clear_claim((sp.conn, owner));
-                let mut st = sp.st.lock();
-                st.parents.retain(|&(c, _)| c != owner);
-                st.credit_parks = 0;
-                drop(st);
-                if prev == 0 {
-                    // Reserves made between top-level steps (a halt run by
-                    // reset, schema-version writes) are under owner 0.
-                    sp.db.clear_claim((sp.conn, 0));
+                // Reserves made between top-level steps (a halt run by
+                // reset, schema-version writes) are under owner 0: a
+                // top-level step's end clears them too (one lock for both).
+                let top = (prev == 0).then_some((sp.conn, 0));
+                sp.db.clear_claims((sp.conn, owner), top);
+                if sp.nested.load(Ordering::Acquire) {
+                    sp.lock().parents.retain(|&(c, _)| c != owner);
                 }
+                sp.credit_parks.store(0, Ordering::Relaxed);
             }
-            sp.st.lock().owner = prev;
+            sp.owner.store(prev, Ordering::Relaxed);
         }
     }
 
@@ -507,11 +586,18 @@ impl Pager {
     /// IdxDelete): `slots` fresh slots, and as many records if a savepoint
     /// is open. Replaces any earlier reserve.
     pub fn stream_reserve_op(&self, slots: u32) -> IOResultOr<()> {
-        if self.stream.is_none() {
+        let Some(sp) = &self.stream else {
+            return Ok(IOResult::Done(()));
+        };
+        let key = sp.key();
+        let records = if self.has_savepoint() { slots } else { 0 };
+        // Fast path: no records, no gate work, and the slots already free.
+        // It does what the clear plus `stream_reserve` below would.
+        if records == 0 && !sp.gated() && sp.db.try_claim_free_slots(key, slots, true) {
+            self.stream_credit_parks_reset();
             return Ok(IOResult::Done(()));
         }
-        self.sp().db.clear_claim(self.stream_key());
-        let records = if self.has_savepoint() { slots } else { 0 };
+        sp.db.clear_claim(key);
         self.stream_reserve(slots, records)
     }
 
@@ -521,12 +607,15 @@ impl Pager {
     /// connection, keeps what it was promised.
     pub(crate) fn stream_end_statement(&self, owner: u64) {
         if let Some(sp) = &self.stream {
-            sp.db.clear_claim((sp.conn, owner));
-            sp.db.clear_claim((sp.conn, 0));
+            sp.db.clear_claims((sp.conn, owner), Some((sp.conn, 0)));
+            if !sp.nested.load(Ordering::Acquire) {
+                // No nested statement is registered under anyone.
+                return;
+            }
             // Nested statements still mid-IO under this one (a trigger, a
             // nested ParseSchema) end with it.
             let mut ended = vec![owner];
-            let mut st = sp.st.lock();
+            let mut st = sp.lock();
             while let Some(i) = st.parents.iter().position(|(_, p)| ended.contains(p)) {
                 let (child, _) = st.parents.swap_remove(i);
                 ended.push(child);
@@ -543,7 +632,8 @@ impl Pager {
     /// inside one are a fork bug (see [`Self::stream_swap_owner`]).
     pub fn stream_mutation(self: &Arc<Self>) -> Option<StreamMutation> {
         let sp = self.stream.as_ref()?;
-        let was = std::mem::replace(&mut sp.st.lock().in_mutation, true);
+        let was = sp.in_mutation.load(Ordering::Relaxed);
+        sp.in_mutation.store(true, Ordering::Relaxed);
         Some(StreamMutation {
             pager: self.clone(),
             was,
@@ -556,8 +646,14 @@ impl Pager {
     /// mutated. Slots or credits short: evict, spill or park.
     pub(crate) fn stream_reserve(&self, slots: u32, records: u32) -> IOResultOr<()> {
         return_if_io!(self.stream_gate());
-        let db = self.sp().db.clone();
+        let db = &self.sp().db;
         let key = self.stream_key();
+        // Fast path: no records asked for or held, and the slots already
+        // free. It does what the full path below would in that case.
+        if records == 0 && db.try_claim_free_slots(key, slots, false) {
+            self.stream_credit_parks_reset();
+            return Ok(IOResult::Done(()));
+        }
         let own = db.claim(key);
         // A nested reserve (free_page inside an opcode's) asks for part of
         // what the outer one claimed: the claim is the larger of the two.
@@ -588,9 +684,11 @@ impl Pager {
         // Make room before claiming (the claim's hold would take the
         // credits a spill needs), but tell the spill what quota these
         // records will take.
-        self.sp().st.lock().pending_records = u64::from(records - own.records);
+        let sp = self.sp();
+        sp.pending_records
+            .store(u64::from(records - own.records), Ordering::Relaxed);
         let room = self.stream_ensure_slots(want);
-        self.sp().st.lock().pending_records = 0;
+        sp.pending_records.store(0, Ordering::Relaxed);
         return_if_io!(room);
         db.set_claim(
             key,
@@ -630,11 +728,11 @@ impl Pager {
     /// connections were promised, or IO (parked until the next run), or
     /// SQLITE_FULL when nothing can ever come back.
     pub(crate) fn stream_ensure_slots(&self, n: u32) -> IOResultOr<()> {
-        let db = self.sp().db.clone();
-        let pool = db.pool().clone();
+        let db = &self.sp().db;
+        let pool = db.pool();
         let (total, free, _) = pool.page_slots();
-        let own = db.claim(self.stream_key()).slots;
-        let others = db.reserved_slots().saturating_sub(own);
+        let (own, reserved) = db.claim_slots(self.stream_key());
+        let others = reserved.saturating_sub(own);
         let want = n.saturating_add(others);
         if free >= want {
             return Ok(IOResult::Done(()));
@@ -716,7 +814,7 @@ impl Pager {
     /// those of the reserve in progress.
     fn stream_spill_quota(&self) -> u64 {
         let db = &self.sp().db;
-        let pending = self.sp().st.lock().pending_records;
+        let pending = self.sp().pending_records.load(Ordering::Relaxed);
         db.quota_left()
             .saturating_sub(db.claimed_records() + pending)
     }
@@ -810,7 +908,7 @@ impl Pager {
                 Err(e) => return Err(self.stream_doom(e)),
             }
             {
-                let mut st = self.sp().st.lock();
+                let mut st = self.sp().lock();
                 st.index.truncate(i as usize);
                 st.index.push(id);
             }
@@ -846,23 +944,31 @@ impl Pager {
 
     /// Wait for a pending savepoint restore. A restore that fails dooms the
     /// transaction.
+    #[inline]
     pub(crate) fn stream_gate(&self) -> IOResultOr<()> {
-        let Some(sp) = &self.stream else {
-            return Ok(IOResult::Done(()));
-        };
+        match &self.stream {
+            // No doom and no restore: nothing to wait for.
+            Some(sp) if sp.gated() => self.stream_gate_slow(sp),
+            _ => Ok(IOResult::Done(())),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stream_gate_slow(&self, sp: &StreamPager) -> IOResultOr<()> {
         if let Some(e) = self.doomed_error() {
             return Err(e.into());
         }
-        let Some(mut r) = sp.st.lock().restore.take() else {
+        let Some(mut r) = sp.lock().restore.take() else {
             return Ok(IOResult::Done(()));
         };
-        sp.st.lock().restoring = true;
+        sp.restoring.store(true, Ordering::Relaxed);
         let res = self.stream_drive_restore(&mut r);
-        sp.st.lock().restoring = false;
+        sp.restoring.store(false, Ordering::Relaxed);
         match res {
             Ok(IOResult::Done(())) => Ok(IOResult::Done(())),
             Ok(IOResult::IO(c)) => {
-                sp.st.lock().restore = Some(r);
+                sp.lock().restore = Some(r);
                 Ok(IOResult::IO(c))
             }
             Err(e) => Err(self.stream_doom(*e).into()),
@@ -976,7 +1082,7 @@ impl Pager {
         let mut seen = RoaringBitmap::new();
         let mut todo = Vec::new();
         {
-            let st = self.sp().st.lock();
+            let st = self.sp().lock();
             for i in start..end.min(st.index.len()) {
                 let id = st.index[i];
                 if id > db_size || !seen.insert(id) {
@@ -992,7 +1098,7 @@ impl Pager {
         // nested image is this savepoint's image too. A page this range
         // does cover is restored again from this range's record, which
         // supersedes the nested one whether or not that one landed.
-        let earlier = self.sp().st.lock().restore.take();
+        let earlier = self.sp().lock().restore.take();
         let mut inflight = Vec::new();
         if let Some(e) = earlier {
             for &(id, rec) in &e.todo[e.next..] {
@@ -1030,7 +1136,7 @@ impl Pager {
             db.stage_discard(db_size as u64, SCRATCH_BASE);
         }
         if !todo.is_empty() || !inflight.is_empty() {
-            self.sp().st.lock().restore = Some(Restore {
+            self.sp().lock().restore = Some(Restore {
                 todo,
                 next: 0,
                 inflight,
@@ -1044,7 +1150,7 @@ impl Pager {
     /// the transaction ended).
     pub(super) fn stream_truncate_records(&self, len: usize) {
         if let Some(sp) = &self.stream {
-            sp.st.lock().index.truncate(len);
+            sp.lock().index.truncate(len);
         }
     }
 
@@ -1060,7 +1166,7 @@ impl Pager {
         // connection staged into (none if it staged nothing). If it is gone
         // (aborted under us), committing the rest as a plain batch would ack
         // a partial transaction.
-        let mine = self.sp().st.lock().txn;
+        let mine = self.sp().lock().txn;
         if db.txn_id() != mine {
             return Err(self
                 .stream_doom(Doom::Io.error())
@@ -1156,12 +1262,12 @@ impl Pager {
 
     fn stream_after_commit(&self) {
         {
-            let mut st = self.sp().st.lock();
+            let mut st = self.sp().lock();
             st.index.clear();
             st.restore = None;
             st.txn = None;
-            st.credit_parks = 0;
         }
+        self.sp().credit_parks.store(0, Ordering::Relaxed);
         self.sp().db.clear_conn_claims(self.sp().conn);
     }
 
@@ -1169,13 +1275,13 @@ impl Pager {
     pub(super) fn stream_on_rollback(&self) {
         if let Some(sp) = &self.stream {
             {
-                let mut st = sp.st.lock();
+                let mut st = sp.lock();
                 st.index.clear();
                 st.restore = None;
                 st.doomed = None;
                 st.txn = None;
-                st.credit_parks = 0;
             }
+            sp.credit_parks.store(0, Ordering::Relaxed);
             sp.db.clear_conn_claims(sp.conn);
         }
     }
@@ -1306,7 +1412,7 @@ impl Pager {
     /// Test hook: nested statements still registered under a parent.
     #[cfg(test)]
     pub(crate) fn stream_test_parents(&self) -> usize {
-        self.sp().st.lock().parents.len()
+        self.sp().lock().parents.len()
     }
 
     /// Test hook: a dirty page's read failed (it is unloaded, as a failed
@@ -1382,7 +1488,7 @@ impl Pager {
 
     #[cfg(any(test, feature = "test_helper"))]
     pub fn stream_records(&self) -> usize {
-        self.stream.as_ref().map_or(0, |s| s.st.lock().index.len())
+        self.stream.as_ref().map_or(0, |s| s.lock().index.len())
     }
 
     /// The WAL as a `StreamWal`, for the open path.

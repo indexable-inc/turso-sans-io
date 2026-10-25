@@ -3741,21 +3741,24 @@ impl Pager {
             {
                 let mut page_cache = self.page_cache.write();
                 let page_key = PageCacheKey::new(page_idx as usize);
-                if self.is_stream() {
-                    let failed = page_cache
-                        .peek(&page_key, false)
-                        .filter(|p| !p.is_loaded() && !p.is_locked());
-                    if let Some(failed) = failed {
-                        // Its stream read failed (the error went to the
-                        // reader that issued it): drop it and read again
-                        // rather than wait forever; a page that can't be
-                        // dropped fails this access (or dooms the txn).
-                        drop(page_cache);
-                        self.stream_take_failed_read(&failed)?;
-                        page_cache = self.page_cache.write();
+                let hit = if self.is_stream() {
+                    match page_cache.get_or_failed(&page_key) {
+                        Some(Ok(page)) => Some(page),
+                        None => None,
+                        Some(Err(failed)) => {
+                            // Its stream read failed (the error went to the
+                            // reader that issued it): drop it and read again
+                            // rather than wait forever; a page that can't be
+                            // dropped fails this access (or dooms the txn).
+                            drop(page_cache);
+                            self.stream_take_failed_read(&failed)?;
+                            page_cache = self.page_cache.write();
+                            page_cache.get(&page_key)?
+                        }
                     }
-                }
-                let hit = page_cache.get(&page_key)?;
+                } else {
+                    page_cache.get(&page_key)?
+                };
                 if let Some(page) = hit {
                     turso_assert!(
                         page_idx as usize == page.get().id(),

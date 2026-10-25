@@ -30,10 +30,11 @@ pub use wal::StreamWal;
 use crate::io::{Buffer, Completion};
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::page_cache::PageCache;
+use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::{Arc, Mutex, RwLock, Weak};
 use crate::{CompletionError, LimboError, Result};
 use roaring::RoaringTreemap;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ptr::NonNull;
 
 /// The store's page size; the only page size a stream database has.
@@ -210,6 +211,111 @@ pub(crate) struct Claim {
 /// (connection id, statement id).
 pub(crate) type ClaimKey = (u64, u64);
 
+/// A map of a few entries as a list: there are only ever a handful of
+/// claims (one per statement mid-step or mid-mutation, per connection) and
+/// of pinned versions, so a linear scan beats a tree, and the list keeps its
+/// capacity (claiming and clearing on every step allocates nothing). Order
+/// is not meaningful.
+///
+/// `len`, when set, is the entry count republished after every change (the
+/// caller holds the lock the map is under), for lock-free "is it empty?"
+/// checks.
+#[derive(Debug)]
+struct SmallMap<K, V> {
+    entries: Vec<(K, V)>,
+    len: Option<Arc<AtomicUsize>>,
+}
+
+impl<K: Copy + Eq + Ord, V> SmallMap<K, V> {
+    fn new(len: Option<Arc<AtomicUsize>>) -> Self {
+        Self {
+            entries: Vec::new(),
+            len,
+        }
+    }
+
+    #[inline]
+    fn publish(&self) {
+        if let Some(len) = &self.len {
+            len.store(self.entries.len(), Ordering::Release);
+        }
+    }
+
+    #[inline]
+    fn pos(&self, key: &K) -> Option<usize> {
+        self.entries.iter().position(|(k, _)| k == key)
+    }
+
+    #[inline]
+    fn get(&self, key: &K) -> Option<&V> {
+        self.pos(key).map(|i| &self.entries[i].1)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, key: &K) -> Option<&mut V> {
+        self.pos(key).map(|i| &mut self.entries[i].1)
+    }
+
+    #[inline]
+    fn insert(&mut self, key: K, v: V) {
+        match self.pos(&key) {
+            Some(i) => self.entries[i].1 = v,
+            None => {
+                self.entries.push((key, v));
+                self.publish();
+            }
+        }
+    }
+
+    /// The entry for `key`, inserted as `V::default()` if there is none.
+    #[inline]
+    fn get_or_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        let i = match self.pos(&key) {
+            Some(i) => i,
+            None => {
+                self.entries.push((key, V::default()));
+                self.publish();
+                self.entries.len() - 1
+            }
+        };
+        &mut self.entries[i].1
+    }
+
+    #[inline]
+    fn remove(&mut self, key: &K) {
+        if let Some(i) = self.pos(key) {
+            self.entries.swap_remove(i);
+            self.publish();
+        }
+    }
+
+    fn retain(&mut self, mut f: impl FnMut(&K, &V) -> bool) {
+        self.entries.retain(|(k, v)| f(k, v));
+        self.publish();
+    }
+
+    #[inline]
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, v)| v)
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Entries sorted by key (tests and messages).
+    #[cfg(test)]
+    fn sorted(&self) -> Vec<(K, &V)> {
+        let mut v: Vec<(K, &V)> = self.entries.iter().map(|(k, v)| (*k, v)).collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    }
+}
+
 struct Txn {
     id: u32,
     /// Stream pages debited from the escrow in this transaction.
@@ -235,7 +341,7 @@ struct Inner {
     /// Every statement's reservation. The slots they claim are kept free
     /// from everyone else; the credits their records' stages will take
     /// (`held`) are kept from reads and spills.
-    claims: BTreeMap<ClaimKey, Claim>,
+    claims: SmallMap<ClaimKey, Claim>,
     next_conn: u64,
     notify: Option<(u64, Completion)>,
     /// Unstaged writes in the open transaction's current part. While it is
@@ -254,15 +360,13 @@ struct Inner {
     /// Quota pages this instance may still write: the batch header's
     /// `quota_pages` at the start of the run, less what this run wrote.
     quota_left: u64,
-    pins: BTreeMap<u64, Pin>,
+    pins: SmallMap<u64, Pin>,
     writer: bool,
     failed: Option<String>,
     /// Buffers staged (or replaced) this run: alive until the host copied
     /// them, whatever happens to their pages meanwhile.
     keep: Vec<Arc<Buffer>>,
     stats: StreamStats,
-    /// The database size in pages, last seen in a loaded page 1 (0: never).
-    size_hint: u32,
     /// Test hook: see `test_set_skip_end_abort`.
     #[cfg(test)]
     skip_end_abort: bool,
@@ -275,6 +379,15 @@ pub struct StreamDb {
     inner: Mutex<Inner>,
     /// Every connection's page cache (they all hold slots of one arena).
     caches: Mutex<Vec<Weak<SharedCache>>>,
+    /// The database size in pages, last seen in a loaded page 1 (0: never).
+    /// A hint only (an upper-bound guess when page 1 is not resident), so
+    /// no lock.
+    size_hint: AtomicU32,
+    /// How many claims `Inner::claims` holds, republished under the lock on
+    /// every change. A connection's own claims are only added by its own
+    /// statements on its own thread, so a zero read here means that it has
+    /// none, and dropping or checking them needs no lock.
+    claim_count: Arc<AtomicUsize>,
 }
 
 impl std::fmt::Debug for StreamDb {
@@ -301,6 +414,7 @@ impl StreamDb {
     /// the database and that nothing else touches.
     pub unsafe fn new(base: NonNull<u8>, slots: u32, head: u64, cfg: StreamConfig) -> Arc<Self> {
         let pool = unsafe { BufferPool::new_external(base, slots, PAGE_SIZE) };
+        let claim_count = Arc::new(AtomicUsize::new(0));
         Arc::new(Self {
             pool,
             cfg,
@@ -311,7 +425,7 @@ impl StreamDb {
                 next_tag: 1,
                 credits: DEFAULT_CREDITS,
                 max_credits: 0,
-                claims: BTreeMap::new(),
+                claims: SmallMap::new(Some(claim_count.clone())),
                 next_conn: 1,
                 notify: None,
                 part_writes: 0,
@@ -320,16 +434,17 @@ impl StreamDb {
                 txn: None,
                 next_txn: 1,
                 quota_left: cfg.quota_pages,
-                pins: BTreeMap::new(),
+                pins: SmallMap::new(None),
                 writer: false,
                 failed: None,
                 keep: Vec::new(),
                 stats: StreamStats::default(),
-                size_hint: 0,
                 #[cfg(test)]
                 skip_end_abort: false,
             }),
             caches: Mutex::new(Vec::new()),
+            size_hint: AtomicU32::new(0),
+            claim_count,
         })
     }
 
@@ -506,6 +621,9 @@ impl StreamDb {
     /// part they open. The open part's room is not counted: a `Latest`
     /// read may stage that part first.
     fn held(g: &Inner) -> u32 {
+        if g.claims.is_empty() {
+            return 0;
+        }
         let records: u64 = g.claims.values().map(|c| u64::from(c.records)).sum();
         if records == 0 {
             return 0;
@@ -627,6 +745,60 @@ impl StreamDb {
         self.inner.lock().claims.remove(&key);
     }
 
+    /// [`Self::clear_claim`] of `a`, then of `b`, under one lock.
+    pub(crate) fn clear_claims(&self, a: ClaimKey, b: Option<ClaimKey>) {
+        // No claims at all: none of this connection's to drop (see
+        // `claim_count`).
+        if self.claim_count.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        let mut g = self.inner.lock();
+        if g.claims.is_empty() {
+            return;
+        }
+        g.claims.remove(&a);
+        if let Some(b) = b {
+            g.claims.remove(&b);
+        }
+    }
+
+    /// `key`'s claimed slots and the slots claimed over every claim, read
+    /// under one lock.
+    pub(crate) fn claim_slots(&self, key: ClaimKey) -> (u32, u32) {
+        let g = self.inner.lock();
+        let own = g.claims.get(&key).map_or(0, |c| c.slots);
+        (own, g.claims.values().map(|c| c.slots).sum())
+    }
+
+    /// The reserve of `slots` fresh slots and no records, done in one lock
+    /// when the arena already has them free on top of every other claim:
+    /// what `Pager::stream_reserve` (after `clear_claim(key)` if `replace`)
+    /// does in that case. True: `key` now claims `max(slots, its claim)`
+    /// slots (none: no claim). False: nothing changed (its claim holds
+    /// records, or the slots are short); take the full path.
+    pub(crate) fn try_claim_free_slots(&self, key: ClaimKey, slots: u32, replace: bool) -> bool {
+        let mut g = self.inner.lock();
+        let cur = g.claims.get(&key).copied().unwrap_or_default();
+        let own = if replace { Claim::default() } else { cur };
+        if own.records > 0 {
+            return false;
+        }
+        let want = slots.max(own.slots);
+        // Every other claim's slots (what the full path's `claim_slots`
+        // gives as reserved less own, after the replace's clear).
+        let total: u32 = g.claims.values().map(|c| c.slots).sum();
+        let others = total.saturating_sub(cur.slots);
+        if self.pool.page_slots().1 < want.saturating_add(others) {
+            return false;
+        }
+        if want == 0 {
+            g.claims.remove(&key);
+        } else {
+            g.claims.insert(key, Claim { slots: want, records: 0 });
+        }
+        true
+    }
+
     /// Drop every claim of connection `conn` (its transaction ended, or it
     /// closed).
     pub(crate) fn clear_conn_claims(&self, conn: u64) {
@@ -643,6 +815,10 @@ impl StreamDb {
     /// room counts: nothing but this statement's own records goes into it
     /// while reads see no free credit.) Counted when not.
     pub(crate) fn claim_short(&self, key: ClaimKey) -> bool {
+        // No claims: `key` holds no records (see `claim_count`).
+        if self.claim_count.load(Ordering::Acquire) == 0 {
+            return false;
+        }
         let mut g = self.inner.lock();
         let records = g.claims.get(&key).map_or(0, |c| c.records);
         if records == 0 {
@@ -720,12 +896,6 @@ impl StreamDb {
         }
         self.bump(|s| s.evictions += n);
         n
-    }
-
-    /// Arena slots claimed over every statement of every connection.
-    pub(crate) fn reserved_slots(&self) -> u32 {
-        let g = self.inner.lock();
-        g.claims.values().map(|c| c.slots).sum()
     }
 
     /// A completion finished at the start of the next run (the store's
@@ -810,7 +980,7 @@ impl StreamDb {
                         ..Default::default()
                     });
                     g.pending.insert(tag, Pending::Pin(v));
-                    g.pins.entry(v).or_default().state = PinState::Pending;
+                    g.pins.get_or_default(v).state = PinState::Pending;
                     g.stats.pins += 1;
                 }
             }
@@ -841,7 +1011,7 @@ impl StreamDb {
 
     /// A reader holds version `v` (pinned lazily at its first read).
     pub(crate) fn hold(&self, v: u64) {
-        self.inner.lock().pins.entry(v).or_default().holders += 1;
+        self.inner.lock().pins.get_or_default(v).holders += 1;
     }
 
     pub(crate) fn release(&self, v: u64) {
@@ -880,7 +1050,7 @@ impl StreamDb {
     #[cfg(test)]
     pub(crate) fn test_claims(&self) -> Vec<(ClaimKey, Claim)> {
         let g = self.inner.lock();
-        g.claims.iter().map(|(k, c)| (*k, *c)).collect()
+        g.claims.sorted().into_iter().map(|(k, c)| (k, *c)).collect()
     }
 
     /// Test hook: the credit state, for a stuck test's message.
@@ -894,10 +1064,11 @@ impl StreamDb {
             g.txn.is_some(),
             g.part_writes,
             g.pending_discard,
-            g.claims,
+            g.claims.sorted(),
             g.pins
-                .iter()
-                .map(|(v, p)| (*v, p.holders, p.state))
+                .sorted()
+                .into_iter()
+                .map(|(v, p)| (v, p.holders, p.state))
                 .collect::<Vec<_>>()
         )
     }
@@ -907,18 +1078,19 @@ impl StreamDb {
     pub(crate) fn test_pins(&self) -> Vec<(u64, u32, bool)> {
         let g = self.inner.lock();
         g.pins
-            .iter()
-            .map(|(v, p)| (*v, p.holders, p.state == PinState::Pending))
+            .sorted()
+            .into_iter()
+            .map(|(v, p)| (v, p.holders, p.state == PinState::Pending))
             .collect()
     }
 
     /// Database size in pages last seen by any connection (0: unknown).
     pub(crate) fn size_hint(&self) -> u32 {
-        self.inner.lock().size_hint
+        self.size_hint.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_size_hint(&self, pages: u32) {
-        self.inner.lock().size_hint = pages;
+        self.size_hint.store(pages, Ordering::Relaxed);
     }
 
     pub(crate) fn try_lock_writer(&self) -> bool {
