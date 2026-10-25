@@ -343,7 +343,9 @@ impl Wal for StreamWal {
     fn rollback(&self, rollback_to: Option<RollbackTo>) {
         // A savepoint rollback keeps the staged parts: the pager discards
         // the grown range and restores pre-images over them (fork change 3).
-        if rollback_to.is_none() {
+        // Only the writer's transaction is open on the store; a reader's
+        // rollback must not abort it.
+        if rollback_to.is_none() && self.writing.load(Ordering::Acquire) {
             self.db.txn_abort();
         }
     }

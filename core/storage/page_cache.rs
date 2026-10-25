@@ -330,6 +330,15 @@ impl PageCache {
     }
 
     fn _delete(&mut self, key: PageCacheKey, clean_page: bool) -> Result<(), CacheError> {
+        self._delete_ext(key, clean_page, false)
+    }
+
+    fn _delete_ext(
+        &mut self,
+        key: PageCacheKey,
+        clean_page: bool,
+        detach_locked: bool,
+    ) -> Result<(), CacheError> {
         let Some(&entry_ptr) = self.map.get(&key) else {
             return Ok(());
         };
@@ -337,7 +346,7 @@ impl PageCache {
         let entry = unsafe { &mut *entry_ptr };
         let page = &entry.page;
 
-        if page.is_locked() {
+        if page.is_locked() && !detach_locked {
             return Err(CacheError::Locked {
                 pgno: page.get().id(),
             });
@@ -785,6 +794,27 @@ impl PageCache {
         self.queue.clear();
         self.clock_hand = std::ptr::null_mut();
         self.evictable_count = 0;
+        Ok(())
+    }
+
+    /// `truncate`, except that a locked page (a read in flight) that is
+    /// neither dirty nor pinned is detached rather than refused: it leaves
+    /// the cache as it is and its read finishes into the detached page,
+    /// which nobody can reach any more (stream storage's rollback).
+    pub fn truncate_detaching_locked(&mut self, max_page_num: usize) -> Result<(), CacheError> {
+        for key in self
+            .map
+            .keys()
+            .filter(|k| k.0 > max_page_num)
+            .copied()
+            .collect::<Vec<_>>()
+        {
+            let locked = self
+                .map
+                .get(&key)
+                .is_some_and(|&e| unsafe { &*e }.page.is_locked());
+            self._delete_ext(key, !locked, true)?;
+        }
         Ok(())
     }
 

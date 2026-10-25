@@ -1288,10 +1288,14 @@ fn failed_rollback_dooms_the_txn() {
     let grown = h.one("PRAGMA page_count");
     assert!(grown > size + 10, "grew: {size} -> {grown}");
     let pager = h.conn.pager.load().clone();
-    assert!(pager.stream_test_lock(grown as usize, true), "last page resident");
+    let pinned = pager
+        .stream_test_pin_above(size as usize)
+        .expect("a grown page is resident");
     let before = h.stats();
     let err = h.exec("ROLLBACK TO a").expect_err("the cache can't drop it");
-    pager.stream_test_lock(grown as usize, false);
+    // The rollback may have dropped the pins with the page.
+    pinned.try_unpin();
+    pinned.try_unpin();
     assert!(h.stats().doomed > before.doomed, "{err}: {:?}", h.stats());
     let _ = h.exec("COMMIT");
     if !h.conn.get_auto_commit() {
@@ -1335,7 +1339,7 @@ fn short_credit_spill_parks_not_full() {
     let mut stmt = h.r.run(|| conn.prepare("UPDATE t SET n = 1")).unwrap();
     let waits = h.stats().credit_waits;
     h.r.credits = 1;
-    let done = step_for(&mut h, &mut stmt, 200).expect("parks, not FULL");
+    let done = step_for(&mut h, &mut stmt, 20).expect("parks, not FULL");
     assert!(!done, "can't finish on one credit a run");
     assert!(h.stats().credit_waits > waits, "{:?}", h.stats());
     h.r.credits = super::DEFAULT_CREDITS;
@@ -1376,12 +1380,7 @@ fn parent_reset_ends_its_triggers_claim() {
         }
     }
     assert!(nested, "the trigger never stopped mid-IO with a claim");
-    // Let its IO land first (a reset waits for IO in flight), without
-    // stepping it: the trigger's claim is still there.
-    for _ in 0..4 {
-        h.r.run(|| {});
-    }
-    assert!(!h.sdb.test_claims().is_empty());
+    // Its IO may still be in flight: a stream reset does not wait for it.
     h.r.run(|| stmt.reset()).unwrap();
     assert!(h.sdb.test_claims().is_empty(), "{:?}", h.sdb.test_claims());
     assert_eq!(pager.stream_test_parents(), 0);
@@ -1475,5 +1474,209 @@ fn failed_read_of_a_dirty_page_dooms_the_txn() {
     }
     assert_eq!(h.r.store.head(), head, "nothing committed");
     assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+}
+
+// ---- final review, round 2 -------------------------------------------------
+
+fn integrity_on(h: &mut H, conn: &Arc<Connection>) {
+    let rows = h
+        .exec_on(conn, "PRAGMA integrity_check", &[])
+        .expect("integrity_check");
+    let text: Vec<String> = rows.iter().map(|r| format!("{:?}", r[0])).collect();
+    assert!(
+        text.len() == 1 && text[0].contains("ok"),
+        "integrity_check: {text:?}"
+    );
+}
+
+const BIG_INSERT: &str = "INSERT INTO t(id, n, v) WITH RECURSIVE c(i) AS (SELECT 1000 UNION ALL SELECT i + 1 FROM c WHERE i < 2200) \
+     SELECT i, 1, zeroblob(900) FROM c";
+
+/// C1/S1: a reader's ROLLBACK TO (its savepoint saw an old size) while a
+/// writer's transaction has spilled parts leaves that transaction alone:
+/// the writer's COMMIT is whole and a fresh connection reads it intact.
+#[test]
+fn reader_rollback_to_keeps_the_writers_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    h.exec_on(&c2, "SAVEPOINT r", &[]).unwrap();
+    h.exec_on(&c2, "SELECT count(*) FROM t", &[]).unwrap();
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT);
+    assert!(h.stats().spilled_pages > 0, "{:?}", h.stats());
+    let discards = h.stats().discards;
+    h.exec_on(&c2, "ROLLBACK TO r", &[]).unwrap();
+    h.exec_on(&c2, "ROLLBACK", &[]).unwrap();
+    assert_eq!(h.stats().discards, discards, "the reader discarded nothing");
+    assert!(h.sdb.txn_open(), "the writer's transaction is still open");
+    h.ok("COMMIT");
+    let c3 = h.connect();
+    let rows = h.exec_on(&c3, "SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 40 + 1201);
+    integrity_on(&mut h, &c3);
+    h.integrity();
+}
+
+/// C2: a reader that is doomed gives up only itself; the writer's
+/// transaction stays open and commits whole.
+#[test]
+fn a_doomed_reader_leaves_the_writers_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let c2 = h.connect();
+    h.exec_on(&c2, "BEGIN", &[]).unwrap();
+    h.exec_on(&c2, "SELECT count(*) FROM t", &[]).unwrap();
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT);
+    assert!(h.sdb.txn_open());
+    let aborts = h.stats().aborts;
+    c2.pager.load().stream_test_doom();
+    assert!(h.sdb.txn_open(), "the reader aborted the writer's transaction");
+    assert_eq!(h.stats().aborts, aborts);
+    assert!(h.exec_on(&c2, "SELECT count(*) FROM t", &[]).is_err());
+    if !c2.get_auto_commit() {
+        h.exec_on(&c2, "ROLLBACK", &[]).unwrap();
+    }
+    h.ok("COMMIT");
+    let rows = h.exec_on(&c2, "SELECT count(*) FROM t", &[]).unwrap();
+    assert_eq!(int(&rows[0][0]), 40 + 1201);
+    integrity_on(&mut h, &c2);
+}
+
+/// C2: a writer whose store transaction was aborted under it (its staged
+/// parts are gone) fails its COMMIT; it never commits the rest as a
+/// plain batch.
+#[test]
+fn an_aborted_txn_is_never_acked_as_a_batch() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let head = h.r.store.head();
+    h.ok("BEGIN");
+    h.ok(BIG_INSERT);
+    assert!(h.stats().spilled_pages > 0);
+    h.r.run(|| h.sdb.txn_abort());
+    let batches = h.stats().batches;
+    h.exec("COMMIT").expect_err("its parts are gone");
+    assert_eq!(h.stats().batches, batches, "no plain batch went out");
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
+    h.integrity();
+}
+
+/// C3: resetting a writer mid-IO whose statement rollback fails (a grown
+/// page is pinned) dooms the transaction, and the abort rolls it back
+/// whole: the connection is in autocommit again with nothing committed.
+#[test]
+fn reset_mid_io_rolls_back_a_doomed_txn() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 10);
+    let size = h.one("PRAGMA page_count") as usize;
+    let head = h.r.store.head();
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    h.ok("UPDATE t SET n = 1 WHERE id = 1");
+    let mut stmt = h.r.run(|| conn.prepare(BIG_INSERT)).unwrap();
+    let pager = conn.pager.load().clone();
+    let mut pinned = None;
+    for _ in 0..MAX_RUNS {
+        assert!(!step_for(&mut h, &mut stmt, 1).unwrap(), "finished first");
+        pinned = pager.stream_test_pin_above(size);
+        if pinned.is_some() {
+            break;
+        }
+    }
+    let pinned = pinned.expect("the insert grew the database");
+    let doomed = h.stats().doomed;
+    let _ = h.r.run(|| stmt.reset());
+    // The rollback may have dropped the pins with the page.
+    pinned.try_unpin();
+    pinned.try_unpin();
+    drop(stmt);
+    assert!(h.stats().doomed > doomed, "{:?}", h.stats());
+    assert!(conn.get_auto_commit(), "abort rolled the transaction back");
+    assert_eq!(h.r.store.head(), head, "nothing committed");
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
+    h.integrity();
+}
+
+/// C4: credit parks are bounded. With a grant that never comes back the
+/// writer fails SQLITE_FULL after about `CREDIT_PARK_LIMIT` runs instead
+/// of parking for ever, and nothing is committed.
+#[test]
+fn credit_parks_are_bounded() {
+    let mut h = H::open(Cfg {
+        slots: 64,
+        ..Cfg::default()
+    });
+    h.fill("t", 100);
+    let head = h.r.store.head();
+    let conn = h.conn.clone();
+    h.ok("BEGIN");
+    let mut stmt = h.r.run(|| conn.prepare("UPDATE t SET n = 1")).unwrap();
+    h.r.credits = 1;
+    let start = h.r.runs;
+    let mut err = None;
+    for _ in 0..1_000 {
+        match step_for(&mut h, &mut stmt, 1) {
+            Ok(false) => {}
+            Ok(true) => panic!("finished on one credit a run"),
+            Err(e) => {
+                err = Some(e);
+                break;
+            }
+        }
+    }
+    let used = h.r.runs - start;
+    let err = err.expect("the parks are bounded");
+    assert!(is_full(&err), "expected SQLITE_FULL, got {err}");
+    assert!(used <= 4 * 64, "gave up after {used} runs");
+    drop(stmt);
+    h.r.credits = super::DEFAULT_CREDITS;
+    if !h.conn.get_auto_commit() {
+        h.ok("ROLLBACK");
+    }
+    assert_eq!(h.r.store.head(), head);
+    assert_eq!(h.one("SELECT sum(n) FROM t"), 0);
+    h.integrity();
+}
+
+/// C5: a grown page with a read in flight (locked) at ROLLBACK TO is
+/// detached from the cache, not a reason to fail the rollback.
+#[test]
+fn rollback_detaches_a_locked_grown_page() {
+    let mut h = H::open(Cfg::default());
+    h.fill("t", 10);
+    let size = h.one("PRAGMA page_count");
+    h.ok("BEGIN");
+    h.ok("SAVEPOINT a");
+    h.ok(BIG_INSERT);
+    let grown = h.one("PRAGMA page_count");
+    let pager = h.conn.pager.load().clone();
+    assert!(pager.stream_test_lock(grown as usize, true), "last page resident");
+    let doomed = h.stats().doomed;
+    h.ok("ROLLBACK TO a");
+    assert!(!pager.stream_test_lock(grown as usize, false), "detached");
+    assert_eq!(h.stats().doomed, doomed);
+    h.ok("COMMIT");
+    assert_eq!(h.one("PRAGMA page_count"), size);
+    assert_eq!(h.one("SELECT count(*) FROM t"), 40);
     h.integrity();
 }

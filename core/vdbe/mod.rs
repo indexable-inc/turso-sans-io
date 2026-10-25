@@ -2906,8 +2906,11 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Option<ProgramStep> {
-        let c = pager.stream_resume_gate()?;
-        self.park_on_io(state, IOCompletions(c), waker)
+        match pager.stream_resume_gate() {
+            Ok(None) => None,
+            Ok(Some(c)) => self.park_on_io(state, IOCompletions(c), waker),
+            Err(e) => self.fail_step(state, pager, e),
+        }
     }
 
     /// An instruction that waits for IO: the statement parks on it and
@@ -3914,6 +3917,14 @@ impl Program {
                         }
                     }
                 },
+            }
+            // Final review C3: the statement rollback above (a reset or
+            // drop's RollbackSavepoint) may have doomed the stream
+            // transaction after the doomed arm was checked; it is aborted
+            // on the store, so roll it back whole now.
+            if pager.stream_doomed() {
+                self.rollback_current_txn(pager);
+                self.connection.set_changes(0);
             }
             if (must_rollback_tx_if_needed || inside_explicit_transaction)
                 && !keeps_prior_changes

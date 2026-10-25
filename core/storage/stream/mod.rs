@@ -933,6 +933,11 @@ impl StreamDb {
         self.inner.lock().txn.is_some()
     }
 
+    /// The open transaction's id on the store.
+    pub(crate) fn txn_id(&self) -> Option<u32> {
+        self.inner.lock().txn.as_ref().map(|t| t.id)
+    }
+
     /// Stream pages among `pages` this transaction has not debited yet
     /// (what staging them costs in quota).
     pub(crate) fn fresh_pages(&self, pages: impl Iterator<Item = u64>) -> u64 {

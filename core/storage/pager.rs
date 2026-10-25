@@ -6293,8 +6293,10 @@ impl Pager {
             if let Some(wal) = self.wal.as_ref() {
                 wal.rollback(None);
             }
-            self.stream_on_rollback();
         }
+        // A reader's own stream state (a doom, its claims) ends with its
+        // transaction too.
+        self.stream_on_rollback();
     }
 
     fn reset_internal_states(&self) {

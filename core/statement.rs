@@ -1713,6 +1713,10 @@ impl Statement {
             .io_completions
             .take()
             .filter(|io| !io.0.is_wait());
+        // Stream storage never blocks: IO in flight finishes on its own
+        // (the store's pending map owns its buffers), and a rollback below
+        // detaches a page whose read has not landed yet.
+        let in_flight = in_flight.filter(|_| !self.pager.is_stream());
         if let Some(io) = in_flight {
             if let Err(err) = io.wait(self.pager.io.as_ref()) {
                 capture_reset_error(

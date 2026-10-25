@@ -50,6 +50,10 @@ pub(crate) struct StreamPager {
     st: Mutex<StreamPagerState>,
 }
 
+/// Credit parks in a row before a reserve gives up (SQLITE_FULL): about
+/// this many runs with a grant too small for what the statement holds.
+const CREDIT_PARK_LIMIT: u32 = 64;
+
 #[derive(Default)]
 struct StreamPagerState {
     /// Record `i` (scratch page `SCRATCH_BASE + i`) holds this db page.
@@ -70,6 +74,14 @@ struct StreamPagerState {
     /// running: no nested statement may step inside it (see
     /// [`Pager::stream_swap_owner`]).
     in_mutation: bool,
+    /// The store transaction this connection opened (by staging into it):
+    /// only it may discard, abort or commit that transaction. The shared
+    /// `StreamDb` holds one open transaction, the writer's; a reader's
+    /// rollback or doom must never touch it.
+    txn: Option<u32>,
+    /// Credit parks in a row (a run's credits short of what a run with the
+    /// largest grant seen would have) since the last reserve that finished.
+    credit_parks: u32,
     restore: Option<Restore>,
     /// The transaction is aborted on the store; the connection must roll
     /// it back (see `stream_doom`).
@@ -177,6 +189,7 @@ impl Pager {
     /// rolls back. Returns `e` for the caller to raise.
     fn stream_doom(&self, e: LimboError) -> LimboError {
         let db = &self.sp().db;
+        let owns = self.stream_owns_txn();
         {
             let mut st = self.sp().st.lock();
             if st.doomed.is_none() {
@@ -184,11 +197,53 @@ impl Pager {
                 st.restore = None;
                 db.bump(|s| s.doomed += 1);
             }
+            st.txn = None;
         }
-        db.txn_abort();
+        // Only this connection's own transaction; another connection's
+        // (the writer's, when a reader is doomed) is not ours to abort.
+        if owns {
+            db.txn_abort();
+        }
         // The transaction is gone: so is every claim made for it.
         db.clear_conn_claims(self.sp().conn);
         e
+    }
+
+    /// Is the store's open transaction the one this connection opened?
+    fn stream_owns_txn(&self) -> bool {
+        let mine = self.sp().st.lock().txn;
+        mine.is_some() && mine == self.sp().db.txn_id()
+    }
+
+    /// A stage went into the store's open transaction: it is this
+    /// connection's.
+    fn stream_note_txn(&self) {
+        let id = self.sp().db.txn_id();
+        self.sp().st.lock().txn = id;
+    }
+
+    /// Park for credits a later run will have, at most
+    /// [`CREDIT_PARK_LIMIT`] times in a row: `max_credits` only ever grows,
+    /// so a grant that shrank for good would otherwise park for ever.
+    /// Past the limit, SQLITE_FULL.
+    fn stream_credit_park(&self) -> IOResultOr<()> {
+        let db = &self.sp().db;
+        let n = {
+            let mut st = self.sp().st.lock();
+            st.credit_parks += 1;
+            st.credit_parks
+        };
+        if n > CREDIT_PARK_LIMIT {
+            self.sp().st.lock().credit_parks = 0;
+            db.bump(|s| s.reserve_full += 1);
+            return Err(stream::full().into());
+        }
+        db.bump_credit_wait();
+        io_yield_one!(db.park());
+    }
+
+    fn stream_credit_parks_reset(&self) {
+        self.sp().st.lock().credit_parks = 0;
     }
 
     /// The claim key of the statement stepping now.
@@ -244,7 +299,10 @@ impl Pager {
         if let Some(sp) = &self.stream {
             if !mid_op {
                 sp.db.clear_claim((sp.conn, owner));
-                sp.st.lock().parents.retain(|&(c, _)| c != owner);
+                let mut st = sp.st.lock();
+                st.parents.retain(|&(c, _)| c != owner);
+                st.credit_parks = 0;
+                drop(st);
                 if prev == 0 {
                     // Reserves made between top-level steps (a halt run by
                     // reset, schema-version writes) are under owner 0.
@@ -260,12 +318,18 @@ impl Pager {
     /// one that reserved them, with a smaller grant or reads in flight),
     /// wait for a run that can. The reserve checked them only in its own
     /// run.
-    pub fn stream_resume_gate(&self) -> Option<Completion> {
-        let sp = self.stream.as_ref()?;
+    pub fn stream_resume_gate(&self) -> Result<Option<Completion>> {
+        let Some(sp) = self.stream.as_ref() else {
+            return Ok(None);
+        };
         if !sp.db.claim_short(self.stream_key()) {
-            return None;
+            return Ok(None);
         }
-        Some(sp.db.park())
+        match self.stream_credit_park() {
+            Ok(IOResult::IO(IOCompletions(c))) => Ok(Some(c)),
+            Ok(IOResult::Done(())) => Ok(None),
+            Err(e) => Err(*e),
+        }
     }
 
     /// Would `add_dirty(page)` write a subjournal record?
@@ -494,9 +558,9 @@ impl Pager {
         // BEGIN (until one is open) and the closing op of each part the
         // records open, over every claim.
         if records > 0 && db.credits() < db.held_credits() {
-            db.bump_credit_wait();
-            io_yield_one!(db.park());
+            return self.stream_credit_park();
         }
+        self.stream_credit_parks_reset();
         Ok(IOResult::Done(()))
     }
 
@@ -565,8 +629,7 @@ impl Pager {
             && db.spill_credit_short()
             && !self.page_cache.read().spillable_pages(1).is_empty()
         {
-            db.bump_credit_wait();
-            io_yield_one!(db.park());
+            return self.stream_credit_park();
         }
         db.bump(|s| s.reserve_full += 1);
         Err(stream::full().into())
@@ -585,7 +648,7 @@ impl Pager {
             };
             let id = page.get().id() as u64;
             match db.stage_write(id - 1, &buf) {
-                Ok(true) => {}
+                Ok(true) => self.stream_note_txn(),
                 Ok(false) => return Err(self.stream_doom(stream::full())),
                 Err(e) => return Err(self.stream_doom(e)),
             }
@@ -652,7 +715,9 @@ impl Pager {
             io_yield_one!(db.park());
         }
         let own = db.claim(self.stream_key()).slots;
-        self.stream_ensure_slots(1 + own)
+        return_if_io!(self.stream_ensure_slots(1 + own));
+        self.stream_credit_parks_reset();
+        Ok(IOResult::Done(()))
     }
 
     /// `add_dirty` in stream mode, before the page is marked dirty: write
@@ -695,7 +760,7 @@ impl Pager {
         if let Some(i) = rec_at {
             // The old slot is the pre-image: stage it as record i.
             match db.stage_write(SCRATCH_BASE + i as u64, &old) {
-                Ok(true) => {}
+                Ok(true) => self.stream_note_txn(),
                 Ok(false) => return Err(self.stream_doom(stream::full())),
                 Err(e) => return Err(self.stream_doom(e)),
             }
@@ -829,6 +894,13 @@ impl Pager {
 
     fn stream_rollback_inner(&self, savepoint: &SavepointSnapshot, end: u64) -> Result<()> {
         self.reset_internal_states();
+        // Final review C1: a connection without the write lock changed
+        // nothing (no dirty pages, no records), and the store's open
+        // transaction, if any, is the writer's: nothing to undo here.
+        if !self.holds_write_lock() {
+            self.invalidate_all_cursors();
+            return Ok(());
+        }
         let db = self.sp().db.clone();
         // The claim of the statement rolling back ends with its step (or
         // its reset), under its own key.
@@ -882,7 +954,8 @@ impl Pager {
                 }
             }
             dirty_pages.remove_range((db_size + 1)..);
-            cache.truncate(db_size as usize)?;
+            // A grown page with a read in flight is detached, not refused.
+            cache.truncate_detaching_locked(db_size as usize)?;
             // Pages being restored: drop the current versions now so nothing
             // reads them before the restore lands.
             for &(id, _) in &todo {
@@ -894,7 +967,7 @@ impl Pager {
             }
         }
         // Rewind: grown pages that were spilled must not be committed.
-        if db.txn_open() {
+        if self.stream_owns_txn() {
             db.stage_discard(db_size as u64, SCRATCH_BASE);
         }
         if !todo.is_empty() || !inflight.is_empty() {
@@ -924,6 +997,16 @@ impl Pager {
     pub(super) fn stream_commit(&self) -> IOResultOr<()> {
         return_if_io!(self.stream_gate());
         let db = self.sp().db.clone();
+        // Final review C2: the store's open transaction must be the one this
+        // connection staged into (none if it staged nothing). If it is gone
+        // (aborted under us), committing the rest as a plain batch would ack
+        // a partial transaction.
+        let mine = self.sp().st.lock().txn;
+        if db.txn_id() != mine {
+            return Err(self
+                .stream_doom(Doom::Io.error())
+                .into());
+        }
         // The transaction is ending: its statements' claims are over (an
         // autocommit statement commits before its own end).
         db.clear_conn_claims(self.sp().conn);
@@ -1017,6 +1100,8 @@ impl Pager {
             let mut st = self.sp().st.lock();
             st.index.clear();
             st.restore = None;
+            st.txn = None;
+            st.credit_parks = 0;
         }
         self.sp().db.clear_conn_claims(self.sp().conn);
     }
@@ -1029,6 +1114,8 @@ impl Pager {
                 st.index.clear();
                 st.restore = None;
                 st.doomed = None;
+                st.txn = None;
+                st.credit_parks = 0;
             }
             sp.db.clear_conn_claims(sp.conn);
         }
@@ -1135,6 +1222,26 @@ impl Pager {
             page.clear_locked();
         }
         true
+    }
+
+    /// Test hook: pin (twice, so a rollback's own unpin leaves it pinned)
+    /// the highest cached page above `min`, as a PinGuard does.
+    #[cfg(test)]
+    pub(crate) fn stream_test_pin_above(&self, min: usize) -> Option<PageRef> {
+        let mut cache = self.page_cache.write();
+        let top = (min + 1..min + 100_000)
+            .rev()
+            .find_map(|id| cache.peek(&PageCacheKey::new(id), false))?;
+        top.pin();
+        top.pin();
+        Some(top)
+    }
+
+    /// Test hook: give this connection's transaction up, as a failed
+    /// rollback or a refused stage does.
+    #[cfg(test)]
+    pub(crate) fn stream_test_doom(&self) {
+        let _ = self.stream_doom(stream::full());
     }
 
     /// Test hook: nested statements still registered under a parent.
